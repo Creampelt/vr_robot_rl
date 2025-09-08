@@ -5,8 +5,11 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
+from tensordict import TensorDict
 
 from robot_rl.utils import resolve_nn_activation
+from robot_rl.networks import MLP, EmpiricalNormalization
+
 
 class MHAEncoder(nn.Module):
     def __init__(
@@ -28,55 +31,37 @@ class MHAEncoder(nn.Module):
         self.height_enc = nn.Sequential(
             nn.Conv2d(1, n_channels, kernel_size, padding="same"),
             resolve_nn_activation(activation),
-            nn.Conv2d(n_channels, n_latent-3, kernel_size, padding="same"),
+            nn.Conv2d(n_channels, n_latent - 3, kernel_size, padding="same"),
             resolve_nn_activation(activation),
         )
         self.mha = nn.MultiheadAttention(n_latent, n_heads, dropout, batch_first=True)
-    
+
     def map_enc(self, map_obs: torch.Tensor) -> torch.Tensor:
         b, l, w, _ = map_obs.shape
         map_z = map_obs[..., 2].unsqueeze(dim=1)  # [b, 1, l, w]
         z_height = self.height_enc(map_z)  # [b, d-3, l, w]
-        z_map = torch.cat((
-            map_obs.view(b, 3, l, w),
-            z_height
-        ), dim=1)  # [b, d, l, w]
+        z_map = torch.cat((map_obs.view(b, 3, l, w), z_height), dim=1)  # [b, d, l, w]
         return z_map.view(b, l * w, -1)  # [b, l * w, d]
-    
+
     def forward(
-        self,
-        proprio_obs: torch.Tensor,
-        map_obs: torch.Tensor,
-        need_weights: bool = False
+        self, proprio_obs: torch.Tensor, map_obs: torch.Tensor, need_weights: bool = False
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         z_map = self.map_enc(map_obs)  # [b, l * w, d]
-        z_proprio = self.proprio_enc(proprio_obs).unsqueeze(dim=1) # [b, 1, d]
+        z_proprio = self.proprio_enc(proprio_obs).unsqueeze(dim=1)  # [b, 1, d]
         z_mha, weights = self.mha(z_proprio, z_map, z_map, need_weights=need_weights)
-        z = torch.cat((
-            z_mha.squeeze(dim=1),
-            proprio_obs,
-        ), dim=-1)  # [b, d + d_obs]
+        z = torch.cat((z_mha.squeeze(dim=1), proprio_obs), dim=-1)  # [b, d + d_obs]
 
         return z, (weights if need_weights else None)
 
-def mlp(in_dim: int, out_dim: int, hidden: list[int], activation: str) -> nn.Sequential:
-    layers = []
-    last = in_dim
-    for h in hidden:
-        layers += [nn.Linear(last, h)]
-        layers += [resolve_nn_activation(activation)]
-        last = h
-    layers += [nn.Linear(last, out_dim)]
-    return nn.Sequential(*layers)
 
 class ActorCriticMHA(nn.Module):
     is_recurrent = False
 
     def __init__(
         self,
-        num_actor_obs,
-        num_critic_obs,
-        num_actions,
+        obs: TensorDict,
+        obs_groups: dict,
+        num_actions: int,
         n_latent: int,
         n_heads: int,
         n_channels: int,
@@ -84,6 +69,8 @@ class ActorCriticMHA(nn.Module):
         n_rows: int,
         n_cols: int,
         dropout: float = 0,
+        actor_obs_normalization: bool = False,
+        critic_obs_normalization: bool = False,
         actor_hidden_dims=[256, 256, 256],
         critic_hidden_dims=[256, 256, 256],
         activation="relu",
@@ -97,26 +84,48 @@ class ActorCriticMHA(nn.Module):
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()
-        d_proprio = num_actor_obs - (n_rows * n_cols * 3)
-        d_enc = n_latent + d_proprio
-        self.encoder = MHAEncoder(
-            d_proprio,
-            n_latent,
-            n_heads,
-            n_channels,
-            kernel_size,
-            dropout,
-            activation
+
+        # get the observation dimensions
+        self.obs_groups = obs_groups
+        num_actor_obs: int = 0
+        for obs_group in obs_groups["policy"]:
+            assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
+            num_actor_obs += obs[obs_group].shape[-1]
+        num_critic_obs: int = 0
+        for obs_group in obs_groups["critic"]:
+            assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
+            num_critic_obs += obs[obs_group].shape[-1]
+
+        assert num_actor_obs == num_critic_obs, (
+            f"Expected actor and critic obs to be the same size, instead got {num_actor_obs=} and {num_critic_obs=}."
         )
 
-        self.actor_head = mlp(d_enc, num_actions, actor_hidden_dims, activation)
-        self.critic_head = mlp(d_enc, 1, critic_hidden_dims, activation)
+        d_proprio = num_actor_obs - (n_rows * n_cols * 3)
+        d_enc = n_latent + d_proprio
+
+        self.encoder = MHAEncoder(d_proprio, n_latent, n_heads, n_channels, kernel_size, dropout, activation)
+        print(f"MHA Encoder: {self.encoder}")
+
+        # actor
+        self.actor_head = MLP(d_enc, num_actions, actor_hidden_dims, activation)
+        # actor observation normalization
+        if actor_obs_normalization:
+            self.actor_obs_normalizer = EmpiricalNormalization(self.num_actor_obs)
+        else:
+            self.actor_obs_normalizer = torch.nn.Identity()
+
+        # critic
+        self.critic_head = MLP(d_enc, 1, critic_hidden_dims, activation)
+        # critic observation normalization
+        self.critic_obs_normalization = critic_obs_normalization
+        if critic_obs_normalization:
+            self.critic_obs_normalizer = EmpiricalNormalization(self.num_critic_obs)
+        else:
+            self.critic_obs_normalizer = torch.nn.Identity()
+        print(f"Critic MLP: {self.critic_head}")
+
         self.l = n_rows
         self.w = n_cols
-
-        print(f"MHA Encoder: {self.encoder}")
-        print(f"Actor MLP: {self.actor_head}")
-        print(f"Critic MLP: {self.critic_head}")
 
         # Action noise
         self.noise_std_type = noise_std_type
@@ -133,14 +142,6 @@ class ActorCriticMHA(nn.Module):
         Normal.set_default_validate_args(False)
         # attention weight heatmap
         self.weights = None
-
-    @staticmethod
-    # not used at the moment
-    def init_weights(sequential, scales):
-        [
-            torch.nn.init.orthogonal_(module.weight, gain=scales[idx])
-            for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
-        ]
 
     def reset(self, dones=None):
         pass
@@ -160,16 +161,17 @@ class ActorCriticMHA(nn.Module):
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
 
-    def get_attention_map(self, observations) -> torch.Tensor:
-        proprio_obs = observations[:, :-self.w * self.l * 3]
-        map_obs = observations[:, -self.w * self.l * 3:].view(-1, self.l, self.w, 3)
+    def get_attention_map(self, obs: TensorDict) -> torch.Tensor:
+        obs = self.get_actor_obs(obs)
+        proprio_obs = obs[:, : -self.w * self.l * 3]
+        map_obs = obs[:, -self.w * self.l * 3 :].view(-1, self.l, self.w, 3)
         _, weights = self.encoder(proprio_obs, map_obs, need_weights=True)
         return weights
 
-    def update_distribution(self, observations, need_weights: bool = False):
+    def update_distribution(self, obs: torch.Tensor) -> None:
         # compute mean
-        proprio_obs = observations[:, :-self.w * self.l * 3]
-        map_obs = observations[:, -self.w * self.l * 3:].view(-1, self.l, self.w, 3)
+        proprio_obs = obs[:, : -self.w * self.l * 3]
+        map_obs = obs[:, -self.w * self.l * 3 :].view(-1, self.l, self.w, 3)
         z, self.weights = self.encoder(proprio_obs, map_obs, need_weights=False)
         mean = self.actor_head(z)
         # compute standard deviation
@@ -182,35 +184,55 @@ class ActorCriticMHA(nn.Module):
         # create distribution
         self.distribution = Normal(mean, std)
 
-    def act(self, observations, **kwargs):
-        self.update_distribution(observations)
+    def act(self, obs: TensorDict, **kwargs) -> torch.Tensor:
+        obs = self.get_actor_obs(obs)
+        obs = self.actor_obs_normalizer(obs)
+        self.update_distribution(obs)
         return self.distribution.sample()
 
-    def get_actions_log_prob(self, actions):
+    def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, observations):
-        proprio_obs = observations[:, :-self.w * self.l * 3]
-        map_obs = observations[:, -self.w * self.l * 3:].view(-1, self.l, self.w, 3)
+    def act_inference(self, obs: TensorDict) -> torch.Tensor:
+        obs = self.get_actor_obs(obs)
+        obs = self.actor_obs_normalizer(obs)
+        proprio_obs = obs[:, : -self.w * self.l * 3]
+        map_obs = obs[:, -self.w * self.l * 3 :].view(-1, self.l, self.w, 3)
         z, _ = self.encoder(proprio_obs, map_obs, need_weights=False)
         actions_mean = self.actor_head(z)
         return actions_mean
 
-    def act_inference_vis(self, observations):
-        proprio_obs = observations[:, :-self.w * self.l * 3]
-        map_obs = observations[:, -self.w * self.l * 3:].view(-1, self.l, self.w, 3)
+    def act_inference_vis(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+        obs = self.get_actor_obs(obs)
+        obs = self.actor_obs_normalizer(obs)
+        proprio_obs = obs[:, : -self.w * self.l * 3]
+        map_obs = obs[:, -self.w * self.l * 3 :].view(-1, self.l, self.w, 3)
         z, weights = self.encoder(proprio_obs, map_obs, need_weights=True)
         actions_mean = self.actor_head(z)
         return actions_mean, weights
 
-    def evaluate(self, critic_observations, **kwargs):
-        proprio_obs = critic_observations[:, :-self.w * self.l * 3]
-        map_obs = critic_observations[:, -self.w * self.l * 3:].view(-1, self.l, self.w, 3)
+    def evaluate(self, obs: TensorDict, **kwargs) -> torch.Tensor:
+        obs = self.get_critic_obs(obs)
+        obs = self.critic_obs_normalizer(obs)
+        proprio_obs = obs[:, : -self.w * self.l * 3]
+        map_obs = obs[:, -self.w * self.l * 3 :].view(-1, self.l, self.w, 3)
         z, _ = self.encoder(proprio_obs, map_obs, need_weights=False)
         value = self.critic_head(z)
         return value
 
-    def load_state_dict(self, state_dict, strict=True):
+    def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:
+        obs_list = []
+        for obs_group in self.obs_groups["policy"]:
+            obs_list.append(obs[obs_group])
+        return torch.cat(obs_list, dim=-1)
+
+    def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
+        obs_list = []
+        for obs_group in self.obs_groups["critic"]:
+            obs_list.append(obs[obs_group])
+        return torch.cat(obs_list, dim=-1)
+
+    def load_state_dict(self, state_dict: dict, strict: bool = True):
         """Load the parameters of the actor-critic model.
 
         Args:
@@ -226,46 +248,40 @@ class ActorCriticMHA(nn.Module):
         super().load_state_dict(state_dict, strict=strict)
         return True
 
+
 if __name__ == "__main__":
+    b = 4096
     num_actor_obs = 48
-    num_critic_obs = 48
-    num_actions = 12
-    n_obs: int = 48
-    n_latent: int = 64
-    n_heads: int = 16
-    n_channels: int = 16
-    kernel_size: int = 5
-    dropout: float = 0
-    actor_hidden_dims=[256, 256, 256]
-    critic_hidden_dims=[256, 256, 256]
-    activation="relu"
-    init_noise_std=1.0
-    noise_std_type: str = "scalar"
+    n_rows = 20
+    n_cols = 20
+
+    obs = TensorDict({"proprio": torch.randn(b, num_actor_obs), "map": torch.randn(b, n_rows, n_cols, 3)})
+    obs_groups = {"policy": ["proprio", "map"], "critic": ["proprio", "map"]}
 
     policy = ActorCriticMHA(
-        num_actor_obs,
-        num_critic_obs,
-        num_actions,
-        n_obs,
-        n_latent,
-        n_heads,
-        n_channels,
-        kernel_size,
-        dropout,
-        actor_hidden_dims,
-        critic_hidden_dims,
-        activation,
-        init_noise_std,
-        noise_std_type,
+        obs,
+        obs_groups,
+        num_actions=12,
+        n_latent=64,
+        n_heads=16,
+        n_channels=16,
+        kernel_size=5,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        dropout=0,
+        actor_obs_normalization=False,
+        critic_obs_normalization=False,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[256, 256, 256],
+        activation="relu",
+        init_noise_std=1.0,
+        noise_std_type="scalar",
     )
 
-    b = 4096
-    proprio_obs = torch.randn(b, num_actor_obs)
-    map_obs = torch.randn(b, 20, 20, 3)
-    out = policy.act([proprio_obs, map_obs])
-    weights = policy.get_attention_map([proprio_obs, map_obs])
+    out = policy.act(obs)
+    weights = policy.get_attention_map(obs)
 
-    print(f"Proprio Obs: {proprio_obs.shape}")
-    print(f"Map Obs: {map_obs.shape}")
+    print(f"Proprio Obs: {obs['proprio'].shape}")
+    print(f"Map Obs: {obs['map'].shape}")
     print(f"Actions: {out.shape}")
     print(f"Weights: {weights.shape}")
