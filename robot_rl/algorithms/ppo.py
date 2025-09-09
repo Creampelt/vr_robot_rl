@@ -129,7 +129,6 @@ class PPO:
         num_transitions_per_env: int,
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
-        last_obs_shape: tuple[int, ...] | list[int] | None = None,
     ) -> None:
         # create rollout storage
         self.storage = RolloutStorage(
@@ -138,7 +137,6 @@ class PPO:
             num_transitions_per_env,
             obs,
             actions_shape,
-            last_obs_shape,
             self.device,
         )
 
@@ -148,7 +146,7 @@ class PPO:
     def train_mode(self):
         self.policy.train()
 
-    def act(self, obs: TensorDict, last_obs: torch.Tensor | None = None):
+    def act(self, obs: TensorDict, last_obs: TensorDict | None = None):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
@@ -162,7 +160,7 @@ class PPO:
         self.transition.last_observations = last_obs
         return self.transition.actions
 
-    def process_env_step(self, obs, rewards, dones, extras, last_obs: torch.Tensor | None = None):
+    def process_env_step(self, obs, rewards, dones, extras, last_obs: TensorDict | None = None):
         # update the normalizers
         self.policy.update_normalization(obs, last_obs=last_obs)
         if self.rnd:

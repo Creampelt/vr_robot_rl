@@ -47,6 +47,8 @@ class OnPolicyRunner:
         default_sets = ["critic"]
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
+        if self.alg_cfg.get("estimator_cfg") is not None:
+            default_sets.append("estimator")
         self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets)
 
         # create the algorithm
@@ -76,9 +78,10 @@ class OnPolicyRunner:
 
         # start learning
         obs = self.env.get_observations().to(self.device)
-        last_obs: torch.Tensor | None = None
+        # populate last_obs if using
+        last_obs: TensorDict | None = None
         if self.use_last_obs:
-            last_obs = self.alg.policy.get_actor_obs(obs)
+            last_obs = obs.clone()
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -110,9 +113,10 @@ class OnPolicyRunner:
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.act(obs, last_obs)
-                    # Step the environment
+                    # Update last_obs if using
                     if self.use_last_obs:
-                        last_obs = self.alg.policy.get_actor_obs(obs)
+                        last_obs = obs.clone()
+                    # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
@@ -325,7 +329,7 @@ class OnPolicyRunner:
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
             self.writer.save_model(path, self.current_learning_iteration)
 
-    def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None):
+    def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None) -> dict:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # -- Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
@@ -342,8 +346,6 @@ class OnPolicyRunner:
         # -- load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
-        if self.alg_cfg["estimator"]:
-            self.estimator_obs_normalizer.load_state_dict(loaded_dict["estimator_norm_state_dict"])
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device=None):
@@ -461,10 +463,6 @@ class OnPolicyRunner:
         alg_class = eval(self.alg_cfg.pop("class_name"))
         alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
-        last_obs_shape: tuple[int] | None = None
-        if self.use_last_obs:
-            last_obs_shape = (actor_critic.num_actor_obs,)
-
         # initialize the storage
         alg.init_storage(
             "rl",
@@ -472,7 +470,6 @@ class OnPolicyRunner:
             self.num_steps_per_env,
             obs,
             [self.env.num_actions],
-            last_obs_shape,
         )
 
         return alg

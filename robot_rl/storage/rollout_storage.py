@@ -37,7 +37,6 @@ class RolloutStorage:
         num_transitions_per_env: int,
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
-        last_obs_shape: tuple[int, ...] | list[int] | None = None,
         device: str = "cpu",
     ):
         # store inputs
@@ -71,11 +70,7 @@ class RolloutStorage:
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # For last observation (for estimation)
-        self.last_obs = (
-            torch.zeros(num_transitions_per_env, num_envs, *last_obs_shape, device=self.device)
-            if last_obs_shape
-            else None
-        )
+        self.last_obs = self.observations.clone()
 
         # For RNN networks
         self.saved_hidden_states_a = None

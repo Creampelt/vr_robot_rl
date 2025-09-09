@@ -72,15 +72,17 @@ class ActorCriticEstimator(ActorCritic):
         self.estimator_obs_normalizer = EmpiricalNormalization(self.num_estimates)
         print(f"Estimator MLP: {self.estimator}")
 
-    def get_estimator_obs(self, obs: TensorDict, last_obs: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
+    def get_estimator_obs(self, obs: TensorDict, last_obs: TensorDict | None = None, **kwargs) -> torch.Tensor:
+        if last_obs is not None:
+            next_obs = obs
+            obs = last_obs
         obs_list = []
         for obs_group in self.obs_groups["estimator"]:
             obs_list.append(obs[obs_group])
         if self.estimate_obs:
             obs_list.append(self.get_actor_obs(obs))
         if self.estimate_next_obs:
-            assert last_obs is not None, "last_obs must not be None if estimate_next_obs is True."
-            obs_list.append(last_obs)
+            obs_list.append(self.get_actor_obs(next_obs))
         return torch.cat(obs_list, dim=-1)
 
     def update_normalization(self, obs: TensorDict, last_obs: torch.Tensor | None = None) -> None:
