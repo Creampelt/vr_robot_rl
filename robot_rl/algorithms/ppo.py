@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from typing import Literal
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tensordict import TensorDict
 from itertools import chain
 
-from robot_rl.modules import ActorCritic, ActorCriticEstimator
+from robot_rl.modules import ActorCritic, ActorCriticEstimator, ActorCriticRecurrent, ActorCriticMHA
 from robot_rl.modules.rnd import RandomNetworkDistillation
 from robot_rl.storage import RolloutStorage
 from robot_rl.utils import string_to_callable
@@ -14,26 +16,26 @@ from robot_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticEstimator
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticMHA | ActorCriticEstimator
     """The actor critic module."""
 
     def __init__(
         self,
-        policy,
-        num_learning_epochs=1,
-        num_mini_batches=1,
-        clip_param=0.2,
-        gamma=0.998,
-        lam=0.95,
-        value_loss_coef=1.0,
-        entropy_coef=0.0,
-        learning_rate=1e-3,
-        max_grad_norm=1.0,
-        use_clipped_value_loss=True,
-        schedule="fixed",
-        desired_kl=0.01,
-        device="cpu",
-        normalize_advantage_per_mini_batch=False,
+        policy: ActorCritic | ActorCriticRecurrent | ActorCriticMHA | ActorCriticEstimator,
+        num_learning_epochs: int = 5,
+        num_mini_batches: int = 4,
+        clip_param: float = 0.2,
+        gamma: float = 0.99,
+        lam: float = 0.95,
+        value_loss_coef: float = 1.0,
+        entropy_coef: float = 0.01,
+        learning_rate: float = 0.001,
+        max_grad_norm: float = 1.0,
+        use_clipped_value_loss: bool = True,
+        schedule: str = "adaptive",
+        desired_kl: float = 0.01,
+        device: str = "cpu",
+        normalize_advantage_per_mini_batch: bool = False,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -57,13 +59,13 @@ class PPO:
 
         # RND components
         if rnd_cfg is not None:
-            # Extract learning rate and remove it from the original dict
-            learning_rate = rnd_cfg.pop("learning_rate", 1e-3)
+            # Extract parameters used in ppo
+            rnd_lr = rnd_cfg.pop("learning_rate", 1e-3)
             # Create RND module
             self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg)
             # Create RND optimizer
             params = self.rnd.predictor.parameters()
-            self.rnd_optimizer = optim.Adam(params, lr=learning_rate)
+            self.rnd_optimizer = optim.Adam(params, lr=rnd_lr)
         else:
             self.rnd = None
             self.rnd_optimizer = None
@@ -90,13 +92,11 @@ class PPO:
             self.symmetry = None
 
         # Estimation components
+        self.estimation: dict | None = estimation_cfg
         if estimation_cfg is not None:
-            self.estimation = estimation_cfg
             self.estimate_loss_coef = estimation_cfg["estimate_loss_coef"]
             self.estimate_loss_ramp = max(estimation_cfg["estimate_loss_ramp"], 1)
             self.counter = 0
-        else:
-            self.estimation = False
 
         # PPO components
         self.policy = policy
@@ -124,29 +124,19 @@ class PPO:
 
     def init_storage(
         self,
-        training_type,
-        num_envs,
-        num_transitions_per_env,
-        actor_obs_shape,
-        critic_obs_shape,
-        actions_shape,
-        estimate_shape=None,
+        training_type: Literal["rl", "distillation"],
+        num_envs: int,
+        num_transitions_per_env: int,
+        obs: TensorDict,
+        actions_shape: tuple[int, ...] | list[int],
     ) -> None:
-        # create memory for RND as well :)
-        if self.rnd:
-            rnd_state_shape = [self.rnd.num_states]
-        else:
-            rnd_state_shape = None
         # create rollout storage
         self.storage = RolloutStorage(
             training_type,
             num_envs,
             num_transitions_per_env,
-            actor_obs_shape,
-            critic_obs_shape,
+            obs,
             actions_shape,
-            rnd_state_shape,
-            estimate_shape,
             self.device,
         )
 
@@ -156,23 +146,26 @@ class PPO:
     def train_mode(self):
         self.policy.train()
 
-    def act(self, obs, critic_obs, estimate_obs=None):
+    def act(self, obs: TensorDict, last_obs: TensorDict | None = None):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
         self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(critic_obs).detach()
+        self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
-        # need to record obs, critic_obs, and estimate_obs before env.step()
+        # need to record obs and last_obs before env.step()
         self.transition.observations = obs
-        self.transition.privileged_observations = critic_obs
-        if estimate_obs is not None:
-            self.transition.estimate_observations = estimate_obs
+        self.transition.last_observations = last_obs
         return self.transition.actions
 
-    def process_env_step(self, rewards, dones, infos):
+    def process_env_step(self, obs, rewards, dones, extras, last_obs: TensorDict | None = None):
+        # update the normalizers
+        self.policy.update_normalization(obs, last_obs=last_obs)
+        if self.rnd:
+            self.rnd.update_normalization(obs)
+
         # Record the rewards and dones
         # Note: we clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
@@ -180,20 +173,15 @@ class PPO:
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
-            # Obtain curiosity gates / observations from infos
-            rnd_state = infos["observations"]["rnd_state"]
             # Compute the intrinsic rewards
-            # note: rnd_state is the gated_state after normalization if normalization is used
-            self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
+            self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
-            # Record the curiosity gates
-            self.transition.rnd_state = rnd_state.clone()
 
         # Bootstrapping on time outs
-        if "time_outs" in infos:
+        if "time_outs" in extras:
             self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1
+                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
             )
 
         # record the transition
@@ -201,9 +189,9 @@ class PPO:
         self.transition.clear()
         self.policy.reset(dones)
 
-    def compute_returns(self, last_critic_obs):
+    def compute_returns(self, obs):
         # compute value for the last step
-        last_values = self.policy.evaluate(last_critic_obs).detach()
+        last_values = self.policy.evaluate(obs).detach()
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
@@ -228,9 +216,10 @@ class PPO:
             mean_symmetry_loss = 0
         else:
             mean_symmetry_loss = None
+        # -- Estimation loss
         if self.estimation:
             mean_estimation_loss = 0
-            mean_estimation_errors = torch.zeros(num_est_obs, requires_grad=False, device=self.device)
+            mean_estimation_errors = torch.zeros(self.policy.num_estimates, requires_grad=False, device=self.device)
             self.counter += 1
         else:
             mean_estimation_loss = None
@@ -244,7 +233,6 @@ class PPO:
         # iterate over batches
         for (
             obs_batch,
-            critic_obs_batch,
             actions_batch,
             target_values_batch,
             advantages_batch,
@@ -254,8 +242,7 @@ class PPO:
             old_sigma_batch,
             hid_states_batch,
             masks_batch,
-            rnd_state_batch,
-            estimate_obs_batch,
+            last_obs_batch,
         ) in generator:
             # obs_batch = obs_batch.clone().requires_grad_()
 
@@ -263,7 +250,8 @@ class PPO:
             # we start with 1 and increase it if we use symmetry augmentation
             num_aug = 1
             # original batch size
-            original_batch_size = obs_batch.shape[0]
+            # we assume policy group is always there and needs augmentation
+            original_batch_size = obs_batch.batch_size[0]
 
             # check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
@@ -276,13 +264,13 @@ class PPO:
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
                 # returned shape: [batch_size * num_aug, ...]
                 obs_batch, actions_batch = data_augmentation_func(
-                    obs=obs_batch, actions=actions_batch, env=self.symmetry["_env"], obs_type="policy"
-                )
-                critic_obs_batch, _ = data_augmentation_func(
-                    obs=critic_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="critic"
+                    obs=obs_batch,
+                    actions=actions_batch,
+                    env=self.symmetry["_env"],
                 )
                 # compute number of augmentations per sample
-                num_aug = int(obs_batch.shape[0] / original_batch_size)
+                # we assume policy group is always there and needs augmentation
+                num_aug = int(obs_batch.batch_size[0] / original_batch_size)
                 # repeat the rest of the batch
                 # -- actor
                 old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_aug, 1)
@@ -297,7 +285,7 @@ class PPO:
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
-            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
             # -- entropy
             # we only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]
@@ -378,7 +366,7 @@ class PPO:
             # Estimation Loss
             if self.estimation:
                 estimates_batch = self.policy.estimate(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
-                estimate_diff = estimate_obs_batch - estimates_batch
+                estimate_diff = self.policy.get_estimator_obs(obs_batch, last_obs=last_obs_batch) - estimates_batch
                 estimate_loss = estimate_diff.pow(2) + estimate_diff.abs()  # L2 + L1 loss
                 estimate_loss = estimate_loss.mean()
                 estimate_errors = estimate_diff.abs().mean(dim=0)
@@ -392,9 +380,7 @@ class PPO:
                 # if we did augmentation before then we don't need to augment again
                 if not self.symmetry["use_data_augmentation"]:
                     data_augmentation_func = self.symmetry["data_augmentation_func"]
-                    obs_batch, _ = data_augmentation_func(
-                        obs=obs_batch, actions=None, env=self.symmetry["_env"], obs_type="policy"
-                    )
+                    obs_batch, _ = data_augmentation_func(obs=obs_batch, actions=None, env=self.symmetry["_env"])
                     # compute number of augmentations per sample
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
@@ -407,7 +393,7 @@ class PPO:
                 #   However, the symmetry loss is computed using the mean of the distribution.
                 action_mean_orig = mean_actions_batch[:original_batch_size]
                 _, actions_mean_symm_batch = data_augmentation_func(
-                    obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
+                    obs=None, actions=action_mean_orig, env=self.symmetry["_env"]
                 )
 
                 # compute the loss (we skip the first augmentation as it is the original one)
@@ -422,7 +408,13 @@ class PPO:
                     symmetry_loss = symmetry_loss.detach()
 
             # Random Network Distillation loss
+            # TODO: Move this processing to inside RND module.
             if self.rnd:
+                # extract the rnd_state
+                # TODO: Check if we still need torch no grad. It is just an affine transformation.
+                with torch.no_grad():
+                    rnd_state_batch = self.rnd.get_rnd_state(obs_batch[:original_batch_size])
+                    rnd_state_batch = self.rnd.state_normalizer(rnd_state_batch)
                 # predict the embedding and the target
                 predicted_embedding = self.rnd.predictor(rnd_state_batch)
                 target_embedding = self.rnd.target(rnd_state_batch).detach()
@@ -500,7 +492,7 @@ class PPO:
         if self.estimation:
             loss_dict["estimation"] = mean_estimation_loss
             # loss_dict["estimation_errors"] = mean_estimation_errors
-            error_dict = {f"estimation_{str(i)}": estimate_errors[i] for i in range(num_est_obs)}
+            error_dict = {f"estimation_{str(i)}": estimate_errors[i] for i in range(self.policy.num_estimates)}
         else:
             error_dict = None
 

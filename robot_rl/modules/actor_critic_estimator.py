@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+from tensordict import TensorDict
 
 from robot_rl.modules import ActorCritic
-from robot_rl.utils import resolve_nn_activation
+from robot_rl.networks import MLP, EmpiricalNormalization
 
 
 class ActorCriticEstimator(ActorCritic):
@@ -13,17 +13,20 @@ class ActorCriticEstimator(ActorCritic):
 
     def __init__(
         self,
-        num_actor_obs,
-        num_critic_obs,
-        num_actions,
-        num_estimates,
-        actor_hidden_dims=[256, 256, 256],
-        critic_hidden_dims=[256, 256, 256],
-        activation="elu",
-        init_noise_std=1.0,
+        obs: TensorDict,
+        obs_groups: dict,
+        num_actions: int,
+        actor_obs_normalization: bool = False,
+        critic_obs_normalization: bool = False,
+        actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
+        critic_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
+        activation: str = "elu",
+        init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
-        estimator_index=-1,
-        oracle=False,
+        estimator_index: int = -1,
+        oracle: bool = False,
+        estimate_obs: bool = False,
+        estimate_next_obs: bool = False,
         **kwargs,
     ):
         if kwargs:
@@ -31,79 +34,77 @@ class ActorCriticEstimator(ActorCritic):
                 "ActorCriticEstimator.__init__ got unexpected arguments, which will be ignored: "
                 + str([key for key in kwargs.keys()])
             )
-        nn.Module.__init__(self)
+        super().__init__(
+            obs,
+            obs_groups,
+            num_actions,
+            actor_obs_normalization,
+            critic_obs_normalization,
+            actor_hidden_dims,
+            critic_hidden_dims,
+            activation,
+            init_noise_std,
+            noise_std_type,
+        )
 
-        mlp_input_dim_a = num_actor_obs
-        mlp_input_dim_c = num_critic_obs
+        self.estimate_obs = estimate_obs
+        self.estimate_next_obs = estimate_next_obs
 
-        self.num_estimates = num_estimates
-        if estimator_index == -1:
-            estimator_index = len(actor_hidden_dims) - 1
-        # Policy
-        shared_layers = []
-        actor_layers = []
-        shared_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
-        shared_layers.append(resolve_nn_activation(activation))
-        for layer_index in range(len(actor_hidden_dims) - 1):
-            if layer_index < estimator_index:
-                shared_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
-                shared_layers.append(resolve_nn_activation(activation))
-            else:
-                actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
-                actor_layers.append(resolve_nn_activation(activation))
-        self.backbone = nn.Sequential(*shared_layers)
-        self.actor = nn.Sequential(*shared_layers, *actor_layers, nn.Linear(actor_hidden_dims[-1], num_actions))
+        # get the observation dimensions
+        self.num_estimates: int = 0
+        for obs_group in obs_groups["estimator"]:
+            assert len(obs[obs_group].shape) == 2, "The ActorCriticEstimator module only supports 1D observations."
+            self.num_estimates += obs[obs_group].shape[-1]
+        if estimate_obs:
+            self.num_estimates += self.num_actor_obs
+        if estimate_next_obs:
+            self.num_estimates += self.num_actor_obs
 
-        if oracle:
-            oracle_layers = []
-            oracle_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
-            oracle_layers.append(resolve_nn_activation(activation))
-            for layer_index in range(len(actor_hidden_dims) - 1):
-                    oracle_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
-                    oracle_layers.append(resolve_nn_activation(activation))
-            self.estimator = nn.Sequential(*oracle_layers, nn.Linear(actor_hidden_dims[-1], num_estimates))
-        else:
-            self.estimator = nn.Sequential(*shared_layers, nn.Linear(actor_hidden_dims[-1], num_estimates))
+        # backbone
+        shared_hidden_dims = actor_hidden_dims[:estimator_index]
+        backbone_output_dim = shared_hidden_dims[-1]
+        self.backbone = MLP(self.num_actor_obs, backbone_output_dim, shared_hidden_dims[:-1], activation)
 
-
-        # Value function
-        critic_layers = []
-        critic_layers.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
-        critic_layers.append(resolve_nn_activation(activation))
-        for layer_index in range(len(critic_hidden_dims)):
-            if layer_index == len(critic_hidden_dims) - 1:
-                critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], 1))
-            else:
-                critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1]))
-                critic_layers.append(resolve_nn_activation(activation))
-        self.critic = nn.Sequential(*critic_layers)
-
-        print(f"Actor MLP: {self.actor}")
-        print(f"Critic MLP: {self.critic}")
+        # estimator
+        estimator_dims = actor_hidden_dims if oracle else shared_hidden_dims
+        self.estimator = MLP(self.num_actor_obs, self.num_estimates, estimator_dims, activation)
+        # estimator observation normalization
+        self.estimator_obs_normalizer = EmpiricalNormalization(self.num_estimates)
         print(f"Estimator MLP: {self.estimator}")
 
-        # Action noise
-        self.noise_std_type = noise_std_type
-        if self.noise_std_type == "scalar":
-            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
-        elif self.noise_std_type == "log":
-            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
-        else:
-            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+    def get_estimator_obs(self, obs: TensorDict, last_obs: TensorDict | None = None, **kwargs) -> torch.Tensor:
+        if last_obs is not None:
+            next_obs = obs
+            obs = last_obs
+        obs_list = []
+        for obs_group in self.obs_groups["estimator"]:
+            obs_list.append(obs[obs_group])
+        if self.estimate_obs:
+            obs_list.append(self.get_actor_obs(obs))
+        if self.estimate_next_obs:
+            obs_list.append(self.get_actor_obs(next_obs))
+        return torch.cat(obs_list, dim=-1)
 
-        # Action distribution (populated in update_distribution)
-        self.distribution = None
-        # disable args validation for speedup
-        Normal.set_default_validate_args(False)
+    def update_normalization(self, obs: TensorDict, last_obs: torch.Tensor | None = None) -> None:
+        super().update_normalization(obs)
+        estimator_obs = self.get_estimator_obs(obs, last_obs)
+        self.estimator_obs_normalizer.update(estimator_obs)
 
-    def estimate(self, observations, **kwargs) -> torch.Tensor:
-        estimates = self.estimator(observations)
-        return estimates
-    
-    def get_latents(self, observations, **kwargs) -> torch.Tensor:
-        latents = self.backbone(observations)
-        return latents
-    
+    def estimate(self, obs: TensorDict, **kwargs) -> torch.Tensor:
+        obs = self.get_actor_obs(obs)
+        obs = self.actor_obs_normalizer(obs)
+        return self.estimator(obs)
+
+    def estimate_inference(self, obs: TensorDict, unnorm: bool = True) -> torch.Tensor:
+        obs = self.get_actor_obs(obs)
+        if not unnorm:
+            obs = self.actor_obs_normalizer(obs)
+        return self.estimator(obs)
+
+    def get_latents(self, obs: TensorDict, **kwargs) -> torch.Tensor:
+        obs = self.get_actor_obs(obs)
+        return self.backbone(obs)
+
     def get_last_layer(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         # Get the weight matrix of the last layer of the actor
         actor_last_layer = self.actor[-1]
@@ -114,3 +115,18 @@ class ActorCriticEstimator(ActorCritic):
         estimator_weights = estimator_last_layer.weight if isinstance(estimator_last_layer, nn.Linear) else None
 
         return actor_weights, estimator_weights
+
+
+def resolve_estimator_config(alg_cfg: dict) -> tuple[dict, bool]:
+    """Resolve the estimator configuration.
+
+    Args:
+        alg_cfg: The algorithm configuration dictionary.
+
+    Returns:
+        A tuple containing the resolved algorithm configuration dictionary and whether the last observations
+        should be used (i.e. if estimate_next_obs is True)
+    """
+    alg_cfg["estimator"] = bool(alg_cfg.get("estimator_cfg") is not None)
+    use_last_obs = bool(alg_cfg["estimator"] and alg_cfg["estimator_cfg"]["estimate_next_obs"])
+    return alg_cfg, use_last_obs

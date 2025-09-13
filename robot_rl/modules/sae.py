@@ -5,19 +5,19 @@ import torch.nn as nn
 
 from robot_rl.utils import resolve_nn_activation
 
+
 class SAE(nn.Module):
     def __init__(
-            self,
-            input_dim: int,
-            hidden_dim_scale: int,
-            sparsity_lambda: float = 1e-3,
-            activation: str = "relu",
-            **kwargs,
+        self,
+        input_dim: int,
+        hidden_dim_scale: int,
+        sparsity_lambda: float = 1e-3,
+        activation: str = "relu",
+        **kwargs,
     ) -> None:
         if kwargs:
             print(
-                "SAE.__init__ got unexpected arguments, which will be ignored: "
-                + str([key for key in kwargs.keys()])
+                "SAE.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()])
             )
         super().__init__()
         self.activation = resolve_nn_activation(activation) if activation else nn.Identity()

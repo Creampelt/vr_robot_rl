@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import torch
+from tensordict import TensorDict
+from typing import Literal
 
 from robot_rl.utils import split_and_pad_trajectories
 
@@ -13,54 +15,43 @@ from robot_rl.utils import split_and_pad_trajectories
 class RolloutStorage:
     class Transition:
         def __init__(self):
-            self.observations = None
-            self.privileged_observations = None
-            self.actions = None
-            self.privileged_actions = None
-            self.rewards = None
-            self.dones = None
-            self.values = None
-            self.actions_log_prob = None
-            self.action_mean = None
-            self.action_sigma = None
-            self.hidden_states = None
-            self.rnd_state = None
-            self.estimate_observations = None
+            self.observations: TensorDict | None = None
+            self.actions: torch.Tensor | None = None
+            self.privileged_actions: torch.Tensor | None = None
+            self.rewards: torch.Tensor | None = None
+            self.dones: torch.Tensor | None = None
+            self.values: torch.Tensor | None = None
+            self.actions_log_prob: torch.Tensor | None = None
+            self.action_mean: torch.Tensor | None = None
+            self.action_sigma: torch.Tensor | None = None
+            self.hidden_states: tuple | None = None
+            self.last_observations: torch.Tensor | None = None
 
         def clear(self):
             self.__init__()
 
     def __init__(
         self,
-        training_type,
-        num_envs,
-        num_transitions_per_env,
-        obs_shape,
-        privileged_obs_shape,
-        actions_shape,
-        rnd_state_shape=None,
-        estimator_shape=None,
-        device="cpu",
+        training_type: Literal["rl", "distillation"],
+        num_envs: int,
+        num_transitions_per_env: int,
+        obs: TensorDict,
+        actions_shape: tuple[int, ...] | list[int],
+        device: str = "cpu",
     ):
         # store inputs
         self.training_type = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
-        self.obs_shape = obs_shape
-        self.privileged_obs_shape = privileged_obs_shape
-        self.rnd_state_shape = rnd_state_shape
         self.actions_shape = actions_shape
-        self.estimator_shape = estimator_shape
 
         # Core
-        self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
-        if privileged_obs_shape is not None:
-            self.privileged_observations = torch.zeros(
-                num_transitions_per_env, num_envs, *privileged_obs_shape, device=self.device
-            )
-        else:
-            self.privileged_observations = None
+        self.observations = TensorDict(
+            {key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()},
+            batch_size=[num_transitions_per_env, num_envs],
+            device=self.device,
+        )
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
@@ -78,13 +69,8 @@ class RolloutStorage:
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
-        # For RND
-        if rnd_state_shape is not None:
-            self.rnd_state = torch.zeros(num_transitions_per_env, num_envs, *rnd_state_shape, device=self.device)
-        
-        # For Estimation
-        if estimator_shape is not None:
-            self.estimator_state = torch.zeros(num_transitions_per_env, num_envs, *estimator_shape, device=self.device)
+        # For last observation (for estimation)
+        self.last_obs = self.observations.clone()
 
         # For RNN networks
         self.saved_hidden_states_a = None
@@ -100,8 +86,6 @@ class RolloutStorage:
 
         # Core
         self.observations[self.step].copy_(transition.observations)
-        if self.privileged_observations is not None:
-            self.privileged_observations[self.step].copy_(transition.privileged_observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
@@ -117,13 +101,9 @@ class RolloutStorage:
             self.mu[self.step].copy_(transition.action_mean)
             self.sigma[self.step].copy_(transition.action_sigma)
 
-        # For RND
-        if self.rnd_state_shape is not None:
-            self.rnd_state[self.step].copy_(transition.rnd_state)
-
-        # For Estimation
-        if self.estimator_shape is not None:
-            self.estimator_state[self.step].copy_(transition.estimate_observations)
+        # For last observation (for estimation)
+        if self.last_obs is not None:
+            self.last_obs[self.step].copy_(transition.last_observations)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -134,7 +114,7 @@ class RolloutStorage:
     def _save_hidden_states(self, hidden_states):
         if hidden_states is None or hidden_states == (None, None):
             return
-        # make a tuple out of GRU hidden state sto match the LSTM format
+        # make a tuple out of GRU hidden states to match the LSTM format
         hid_a = hidden_states[0] if isinstance(hidden_states[0], tuple) else (hidden_states[0],)
         hid_c = hidden_states[1] if isinstance(hidden_states[1], tuple) else (hidden_states[1],)
         # initialize if needed
@@ -142,6 +122,7 @@ class RolloutStorage:
             self.saved_hidden_states_a = [
                 torch.zeros(self.observations.shape[0], *hid_a[i].shape, device=self.device) for i in range(len(hid_a))
             ]
+        if self.saved_hidden_states_c is None:
             self.saved_hidden_states_c = [
                 torch.zeros(self.observations.shape[0], *hid_c[i].shape, device=self.device) for i in range(len(hid_c))
             ]
@@ -183,13 +164,7 @@ class RolloutStorage:
             raise ValueError("This function is only available for distillation training.")
 
         for i in range(self.num_transitions_per_env):
-            if self.privileged_observations is not None:
-                privileged_observations = self.privileged_observations[i]
-            else:
-                privileged_observations = self.observations[i]
-            yield self.observations[i], privileged_observations, self.actions[i], self.privileged_actions[
-                i
-            ], self.dones[i]
+            yield self.observations[i], self.actions[i], self.privileged_actions[i], self.dones[i]
 
     # for reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
@@ -201,11 +176,6 @@ class RolloutStorage:
 
         # Core
         observations = self.observations.flatten(0, 1)
-        if self.privileged_observations is not None:
-            privileged_observations = self.privileged_observations.flatten(0, 1)
-        else:
-            privileged_observations = observations
-
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
@@ -216,13 +186,8 @@ class RolloutStorage:
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
 
-        # For RND
-        if self.rnd_state_shape is not None:
-            rnd_state = self.rnd_state.flatten(0, 1)
-        
-        # For Estimation
-        if self.estimator_shape is not None:
-            estimate = self.estimator_state.flatten(0, 1)
+        # For last observation (for estimation)
+        last_obs = self.last_obs.flatten(0, 1) if self.last_obs is not None else None
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -234,7 +199,6 @@ class RolloutStorage:
                 # Create the mini-batch
                 # -- Core
                 obs_batch = observations[batch_idx]
-                privileged_observations_batch = privileged_observations[batch_idx]
                 actions_batch = actions[batch_idx]
 
                 # -- For PPO
@@ -245,43 +209,34 @@ class RolloutStorage:
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
 
-                # -- For RND
-                if self.rnd_state_shape is not None:
-                    rnd_state_batch = rnd_state[batch_idx]
-                else:
-                    rnd_state_batch = None
-                
-                # -- For Estimation
-                if self.estimator_shape is not None:
-                    estimate_batch = estimate[batch_idx]
-                else:
-                    estimate_batch = None
+                # -- For last observation (for estimation)
+                last_obs_batch = last_obs[batch_idx] if last_obs is not None else None
 
                 # yield the mini-batch
-                yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                yield (
+                    obs_batch,
+                    actions_batch,
+                    target_values_batch,
+                    advantages_batch,
+                    returns_batch,
+                    old_actions_log_prob_batch,
+                    old_mu_batch,
+                    old_sigma_batch,
+                    (None, None),
                     None,
-                    None,
-                ), None, rnd_state_batch, estimate_batch
+                    last_obs_batch,
+                )
 
-    # for reinfrocement learning with recurrent networks
+    # for reinforcement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
-        if self.privileged_observations is not None:
-            padded_privileged_obs_trajectories, _ = split_and_pad_trajectories(self.privileged_observations, self.dones)
-        else:
-            padded_privileged_obs_trajectories = padded_obs_trajectories
 
-        if self.rnd_state_shape is not None:
-            padded_rnd_state_trajectories, _ = split_and_pad_trajectories(self.rnd_state, self.dones)
+        if self.last_obs is not None:
+            padded_last_obs_trajectories, _ = split_and_pad_trajectories(self.last_obs, self.dones)
         else:
-            padded_rnd_state_trajectories = None
-        
-        if self.estimator_shape is not None:
-            padded_estimate_trajectories, _ = split_and_pad_trajectories(self.estimator_state, self.dones)
-        else:
-            padded_estimate_trajectories = None
+            padded_last_obs_trajectories = None
 
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
@@ -299,17 +254,12 @@ class RolloutStorage:
 
                 masks_batch = trajectory_masks[:, first_traj:last_traj]
                 obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
-                privileged_obs_batch = padded_privileged_obs_trajectories[:, first_traj:last_traj]
 
-                if padded_rnd_state_trajectories is not None:
-                    rnd_state_batch = padded_rnd_state_trajectories[:, first_traj:last_traj]
-                else:
-                    rnd_state_batch = None
-                
-                if padded_estimate_trajectories is not None:
-                    estimate_batch = padded_estimate_trajectories[:, first_traj:last_traj]
-                else:
-                    estimate_batch = None
+                last_obs_batch = (
+                    padded_last_obs_trajectories[:, first_traj:last_traj]
+                    if padded_last_obs_trajectories is not None
+                    else None
+                )
 
                 actions_batch = self.actions[:, start:stop]
                 old_mu_batch = self.mu[:, start:stop]
@@ -339,9 +289,18 @@ class RolloutStorage:
                 hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
                 hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
 
-                yield obs_batch, privileged_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
-                    hid_a_batch,
-                    hid_c_batch,
-                ), masks_batch, rnd_state_batch, estimate_batch
+                yield (
+                    obs_batch,
+                    actions_batch,
+                    values_batch,
+                    advantages_batch,
+                    returns_batch,
+                    old_actions_log_prob_batch,
+                    old_mu_batch,
+                    old_sigma_batch,
+                    (hid_a_batch, hid_c_batch),
+                    masks_batch,
+                    last_obs_batch,
+                )
 
                 first_traj = last_traj

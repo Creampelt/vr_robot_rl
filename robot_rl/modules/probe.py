@@ -5,19 +5,19 @@ import torch.nn as nn
 
 from robot_rl.utils import resolve_nn_activation
 
+
 class Probe(nn.Module):
     def __init__(
-            self,
-            input_dim: int,
-            output_dim: int,
-            probe_hidden_dims: list = [],
-            activation: str = "elu",
-            **kwargs,
+        self,
+        input_dim: int,
+        output_dim: int,
+        probe_hidden_dims: list = [],
+        activation: str = "elu",
+        **kwargs,
     ) -> None:
         if kwargs:
             print(
-                "Probe.__init__ got unexpected arguments, which will be ignored: "
-                + str([key for key in kwargs.keys()])
+                "Probe.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()])
             )
         super().__init__()
 
@@ -37,14 +37,6 @@ class Probe(nn.Module):
             self.probe = nn.Sequential(nn.Linear(input_dim, output_dim))
 
         print(f"Probe MLP: {self.probe}")
-
-    @staticmethod
-    # not used at the moment
-    def init_weights(sequential, scales) -> None:
-        [
-            nn.init.orthogonal_(module.weight, gain=scales[idx])
-            for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
-        ]
 
     def forward(self, z) -> torch.Tensor:
         return self.probe(z)
