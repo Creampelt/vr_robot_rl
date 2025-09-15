@@ -161,7 +161,7 @@ class OnPolicyRunner:
                 self.alg.compute_returns(obs)
 
             # update policy
-            loss_dict, error_dict = self.alg.update(self.num_estimates_all)
+            loss_dict, error_dict = self.alg.update()
 
             stop = time.time()
             learn_time = stop - start
@@ -470,6 +470,7 @@ class OnPolicyRunner:
             self.num_steps_per_env,
             obs,
             [self.env.num_actions],
+            self.use_last_obs,
         )
 
         return alg

@@ -85,7 +85,7 @@ class ActorCriticEstimator(ActorCritic):
             obs_list.append(self.get_actor_obs(next_obs))
         return torch.cat(obs_list, dim=-1)
 
-    def update_normalization(self, obs: TensorDict, last_obs: torch.Tensor | None = None) -> None:
+    def update_normalization(self, obs: TensorDict, last_obs: torch.Tensor | None = None, **kwargs) -> None:
         super().update_normalization(obs)
         estimator_obs = self.get_estimator_obs(obs, last_obs)
         self.estimator_obs_normalizer.update(estimator_obs)

@@ -157,7 +157,7 @@ class ActorCriticRecurrent(nn.Module):
     def get_hidden_states(self):
         return self.memory_a.hidden_states, self.memory_c.hidden_states
 
-    def update_normalization(self, obs):
+    def update_normalization(self, obs, **kwargs):
         if self.actor_obs_normalization:
             actor_obs = self.get_actor_obs(obs)
             self.actor_obs_normalizer.update(actor_obs)

@@ -129,6 +129,7 @@ class PPO:
         num_transitions_per_env: int,
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
+        use_last_obs,
     ) -> None:
         # create rollout storage
         self.storage = RolloutStorage(
@@ -138,6 +139,7 @@ class PPO:
             obs,
             actions_shape,
             self.device,
+            use_last_obs,
         )
 
     def test_mode(self):
@@ -201,7 +203,7 @@ class PPO:
     #     gradient_penalty_loss = torch.sum(torch.square(grad_log_prob), dim=-1).mean()
     #     return gradient_penalty_loss
 
-    def update(self, num_est_obs: int | None = None):  # noqa: C901
+    def update(self):  # noqa: C901
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
