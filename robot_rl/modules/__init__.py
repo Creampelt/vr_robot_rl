@@ -15,6 +15,9 @@ from .actor_critic_mha import ActorCriticMHA
 from .probe import Probe
 from .sae import SAE
 from .symmetry import *
+from .cosmos import Cosmos
+from .rae import RAE
+from .superpoint import SuperPoint
 
 __all__ = [
     "ActorCritic",
@@ -25,4 +28,7 @@ __all__ = [
     "StudentTeacherRecurrent",
     "Probe",
     "SAE",
+    "RAE",
+    "SuperPoint",
+    "Cosmos",
 ]
