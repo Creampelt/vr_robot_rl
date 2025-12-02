@@ -33,6 +33,7 @@ dependencies = [
     "numpy>=1.16.4",
     "GitPython",
     "onnx",
+    "torchao",
 ]
 
 [project.urls]
