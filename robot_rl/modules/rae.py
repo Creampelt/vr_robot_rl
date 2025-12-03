@@ -1,26 +1,34 @@
 import torch
 import torch.nn as nn
-from transformers import TorchAoConfig, AutoImageProcessor, AutoModel
-from torchao.quantization import Int4WeightOnlyConfig
+from transformers import AutoImageProcessor, AutoModel
+
 
 class RAE(nn.Module):
-    def __init__(self):
+    def __init__(self, pretrained_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m") -> None:
         super().__init__()
-        self.processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitsplus-pretrain-lvd1689m")
-        # quantization to reduce memory usage
-        quant_type = Int4WeightOnlyConfig(group_size=128)
-        quantization_config = TorchAoConfig(quant_type=quant_type)
+        self.feature_dim = 384
+        self.processor = AutoImageProcessor.from_pretrained(pretrained_model_name, use_fast=True)
 
         self.model = AutoModel.from_pretrained(
-            "facebook/dinov3-vit7b16-pretrain-lvd1689m",
+            pretrained_model_name,
             dtype=torch.bfloat16,
             device_map="auto",
-            quantization_config=quantization_config
-            # add_pooling_layer=True
         )
 
-    def forward(self, image): # recommended shape - (3, 224, 224), the image should be a PIL image
-        inputs = self.processor(images=image, return_tensors="pt").to(self.model.device)
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode batched images into feature vectors.
+
+        Args:
+            images (torch.Tensor): Batched RGB images. Shape is Bx3xHxW, where H and W are divisible by 16 and >= 224.
+
+        Returns:
+            test (torch.Tensor): Feature vector of images. Shape is Bx384.
+        """
+        _, H, W, C = images.shape
+        assert (H % 16 == 0) and (W % 16 == 0) and H > 224 and W > 224 and C == 3, (
+            f"Height, width, and/or channels of image do not meet requirements. Got {H=}, {W=}, {C=}"
+        )
+        inputs = self.processor(images=images, return_tensors="pt").to(self.model.device)
         with torch.inference_mode():
             outputs = self.model(**inputs)
 
