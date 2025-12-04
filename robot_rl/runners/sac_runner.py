@@ -133,6 +133,8 @@ class SACRunner:
         
         # Construct initial state dynamically: [z_t, z_{t-1}, a_{t-1}]
         state = torch.cat([current_latent, prev_latent, prev_action], dim=-1)
+        # Sanitize state to avoid NaNs/Infs propagating into actor
+        state = torch.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
         
         # Switch to train mode
         self.train_mode()
@@ -177,6 +179,8 @@ class SACRunner:
                     actions = (torch.rand((num_envs, action_dim), device=self.device) * 2 - 1) * self.max_action
                 else:
                     # Sample from actor policy
+                    # Ensure no NaNs/Infs in state before actor
+                    state = torch.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
                     actions, _ = self.alg.actor(state)
             
             # Phase 3: Environment Response
@@ -195,6 +199,7 @@ class SACRunner:
             
             # Construct next state
             next_state = torch.cat([next_latent, current_latent, actions], dim=-1)
+            next_state = torch.nan_to_num(next_state, nan=0.0, posinf=1e6, neginf=-1e6)
             
             # Phase 5: Learning (SAC Update)
             # Store transitions in replay buffer (vectorized for efficiency)

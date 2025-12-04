@@ -454,10 +454,59 @@ class OnPolicyRunner:
                 self.policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
 
         # initialize the actor-critic
-        actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticMHA | ActorCriticEstimator = actor_critic_class(
-            obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
+        # Check if using VLM policy (special handling)
+        class_name = self.policy_cfg.get("class_name", "ActorCritic")
+        if class_name == "VLMActorCritic":
+            from robot_rl.networks.vlm_policy import create_vlm_actor_critic
+            from tensordict import TensorDict
+            
+            # Extract VLM-specific config
+            policy_cfg_copy = self.policy_cfg.copy()
+            policy_cfg_copy.pop("class_name")
+            
+            # Calculate total critic observation dimension
+            # For VLM policy, we need to calculate what the final concatenated critic obs will be
+            # after processing through VLM (camera -> VLM embeddings + other privileged obs)
+            critic_obs_dim = None
+            
+            if "critic" in self.cfg["obs_groups"] and "critic" in obs:
+                critic_group = obs["critic"]
+                
+                # Determine VLM embedding dimension from text model name
+                text_model = policy_cfg_copy.get("text_model_name", "sentence-transformers/all-mpnet-base-v2")
+                if "384" in text_model or "MiniLM" in text_model or "bge-small" in text_model:
+                    vlm_embedding_dim = 384
+                else:
+                    vlm_embedding_dim = 768  # Default for all-mpnet-base-v2
+                
+                # Calculate critic dimension: VLM embeddings + other observations
+                if isinstance(critic_group, TensorDict):
+                    # Count dimensions: camera becomes VLM embeddings, others stay as is
+                    critic_obs_dim = vlm_embedding_dim  # Camera -> VLM embeddings
+                    
+                    for key in critic_group.keys():
+                        if key != "camera":
+                            obs_tensor = critic_group[key]
+                            if obs_tensor.ndim > 1:
+                                critic_obs_dim += obs_tensor.shape[-1]
+                            else:
+                                critic_obs_dim += 1
+                    
+                    print(f"[OnPolicyRunner] Computed critic obs dim: {critic_obs_dim} (VLM: {vlm_embedding_dim} + other obs)")
+            
+            # Create VLM actor-critic using factory function
+            actor_critic = create_vlm_actor_critic(
+                num_actions=self.env.num_actions,
+                num_critic_obs=critic_obs_dim,
+                device=self.device,
+                **policy_cfg_copy
+            )
+        else:
+            # Standard actor-critic initialization
+            actor_critic_class = eval(self.policy_cfg.pop("class_name"))
+            actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticMHA | ActorCriticEstimator = actor_critic_class(
+                obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
+            ).to(self.device)
 
         # initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
