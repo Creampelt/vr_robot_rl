@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from transformers import AutoImageProcessor, AutoModel
 
-
 class RAE(nn.Module):
     def __init__(self, pretrained_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m") -> None:
         super().__init__()

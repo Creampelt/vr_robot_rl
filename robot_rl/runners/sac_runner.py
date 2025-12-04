@@ -7,13 +7,12 @@ import statistics
 import time
 import torch
 import warnings
+import numpy as np
 from collections import deque
 from tensordict import TensorDict
 
 import robot_rl
 from robot_rl.env import VecEnv
-from robot_rl.modules.rae import RAE
-from robot_rl.modules.superpoint import SuperPoint
 from robot_rl.utils import resolve_obs_groups, store_code_state
 
 class SACRunner:
@@ -21,8 +20,9 @@ class SACRunner:
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
-        self.alg_cfg = train_cfg["algorithm"]
-        self.policy_cfg = train_cfg["policy"]
+        # SAC config has flat structure, not nested under "algorithm"
+        self.alg_cfg = train_cfg.get("algorithm", train_cfg)  # Fallback to train_cfg if no algorithm key
+        self.policy_cfg = train_cfg.get("policy", {})
         self.device = device
         self.env = env
 
@@ -30,7 +30,13 @@ class SACRunner:
         self._configure_multi_gpu()
 
         # store training configuration
-        self.num_steps_per_env = self.cfg.get("num_steps_per_env", 100)
+        num_steps = self.cfg.get("num_steps_per_env", 100)
+        # Handle case where num_steps_per_env might be nested or a dict
+        if isinstance(num_steps, dict):
+            print(f"[WARNING] num_steps_per_env is a dict: {num_steps}, using default value 100")
+            self.num_steps_per_env = 100
+        else:
+            self.num_steps_per_env = num_steps
         self.save_interval = self.cfg["save_interval"]
         
         # SAC-specific configuration
@@ -38,14 +44,20 @@ class SACRunner:
         self.batch_size = self.cfg.get("batch_size", 256)
         self.warmup_steps = self.cfg.get("warmup_steps", 1000)
         self.update_frequency = self.cfg.get("update_frequency", 1)
+        self.gradient_steps = self.cfg.get("gradient_steps", 1)  # Number of gradient steps per update
 
         # query observations from environment for algorithm construction
-        obs = self.env.get_observations()
+        obs_td = self.env.get_observations()
         default_sets = ["critic"]
-        self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg.get("obs_groups", {}), default_sets)
+        self.cfg["obs_groups"] = resolve_obs_groups(obs_td, self.cfg.get("obs_groups", {}), default_sets)
 
-        # create the algorithm (SAC actor-critic)
-        self.alg = self._construct_algorithm(obs)
+        # select observation tensor for policy: prefer camera latents if present, else policy group
+        init_obs = obs_td.get("camera", obs_td.get("policy"))
+        if init_obs is None:
+            raise RuntimeError("No compatible observation group found: expected 'camera' or 'policy'.")
+
+        # create the algorithm (SAC actor-critic) using dynamic state dimension
+        self.alg = self._construct_algorithm(init_obs)
         
         # SAC-specific parameters
         self.gamma = self.alg_cfg.get("gamma", 0.99)
@@ -82,8 +94,6 @@ class SACRunner:
         self.git_status_repos = [robot_rl.__file__]
         
         # VOILA-specific modules
-        self.rae = None
-        self.superpoint = None
         self.expert_descriptors = []
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
@@ -95,48 +105,33 @@ class SACRunner:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
-
-        # VOILA SAC Training Setup
-        # Initialize frozen RAE encoder for visual features
-        self.rae = RAE().to(self.device)
-        self.rae.eval()  # Freeze encoder
-        
-        # Initialize SuperPoint for keypoint extraction
-        # self.superpoint = SuperPoint().to(self.device)
-        # self.superpoint.eval()
-        
-        # Generate expert rollout frames using world model
-        frames = self._generate_expert_frames()
-        num_expert_frames = len(frames)
-        
-        # Pre-extract expert frame features (SuperPoint descriptors)
-        # print(f"[INFO] Extracting features from {num_expert_frames} expert frames...")
-        # self.expert_descriptors = []
-        # for i in range(num_expert_frames):
-        #     with torch.no_grad():
-        #         desc = self.superpoint.extract_features(frames[i])
-        #     self.expert_descriptors.append(desc)
         
         # Initialize state tracking
         num_envs = self.env.num_envs
         action_dim = self.env.num_actions
         
+        # Determine observation dimension dynamically from initial obs
+        obs_dict_initial = self.env.get_observations().to(self.device)
+        current_obs = obs_dict_initial.get("camera", obs_dict_initial.get("policy"))
+        if current_obs is None:
+            raise RuntimeError("No compatible observation group found at learn start: expected 'camera' or 'policy'.")
+        obs_dim = current_obs.shape[-1]
+
         # Previous latents (z_{t-1}) - initialize with zeros
-        prev_latent = torch.zeros((num_envs, 512), device=self.device)  # RAE output dim
+        prev_latent = torch.zeros((num_envs, obs_dim), device=self.device)
         # Previous actions (a_{t-1})
         prev_action = torch.zeros((num_envs, action_dim), device=self.device)
         # Expert frame indices for each environment
         expert_indices = torch.zeros(num_envs, dtype=torch.long, device=self.device)
         
-        # Get initial camera observations from environment
+        # Get initial observations (latents) from environment
         obs_dict = self.env.get_observations().to(self.device)
-        camera_obs = obs_dict.get("camera", obs_dict.get("policy"))  # Adjust key based on your env
+        # Phase 1: Initial latent/obs (prefer camera, else policy)
+        current_latent = obs_dict.get("camera", obs_dict.get("policy"))  # z_t (num_envs, D)
+        if current_latent is None:
+            raise RuntimeError("No compatible observation group found during rollout: expected 'camera' or 'policy'.")
         
-        # Phase 1: Initial encoding
-        with torch.no_grad():
-            current_latent = self.rae(camera_obs)  # z_t (num_envs, 512)
-        
-        # Construct initial state: [z_t, z_{t-1}, a_{t-1}] (1026-dim)
+        # Construct initial state dynamically: [z_t, z_{t-1}, a_{t-1}]
         state = torch.cat([current_latent, prev_latent, prev_action], dim=-1)
         
         # Switch to train mode
@@ -149,14 +144,17 @@ class SACRunner:
         cur_reward_sum = torch.zeros(num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(num_envs, dtype=torch.float, device=self.device)
         
-        # Replay buffer (states, actions, rewards, next_states, dones)
+        # Efficient circular replay buffer using numpy arrays
+        state_dim = obs_dim * 2 + action_dim
         replay_buffer = {
-            "states": [],
-            "actions": [],
-            "rewards": [],
-            "next_states": [],
-            "dones": []
+            "states": np.zeros((self.replay_buffer_size, state_dim), dtype=np.float32),
+            "actions": np.zeros((self.replay_buffer_size, action_dim), dtype=np.float32),
+            "rewards": np.zeros((self.replay_buffer_size, 1), dtype=np.float32),
+            "next_states": np.zeros((self.replay_buffer_size, state_dim), dtype=np.float32),
+            "dones": np.zeros((self.replay_buffer_size, 1), dtype=np.float32)
         }
+        buffer_pos = 0
+        buffer_full = False
         
         # Ensure all parameters are in-synced
         if self.is_distributed:
@@ -184,11 +182,10 @@ class SACRunner:
             # Phase 3: Environment Response
             obs_dict, rewards, dones, extras = self.env.step(actions.to(self.env.device))
             obs_dict, rewards, dones = (obs_dict.to(self.device), rewards.to(self.device), dones.to(self.device))
-            camera_obs_next = obs_dict.get("camera", obs_dict.get("policy"))
+            latents_next = obs_dict.get("camera", obs_dict.get("policy"))
             
-            # Encode new observation
-            with torch.no_grad():
-                next_latent = self.rae(camera_obs_next)  # z_{t+1}
+            # Next latent directly from env observations
+            next_latent = latents_next  # z_{t+1}
             
             # Phase 4: VOILA Reward Calculation (now handled by env.step)
             # voila_rewards = self._compute_voila_rewards(
@@ -200,24 +197,25 @@ class SACRunner:
             next_state = torch.cat([next_latent, current_latent, actions], dim=-1)
             
             # Phase 5: Learning (SAC Update)
-            # Store transitions in replay buffer
+            # Store transitions in replay buffer (vectorized for efficiency)
             for env_idx in range(num_envs):
-                if len(replay_buffer["states"]) >= self.replay_buffer_size:
-                    # Remove oldest transitions
-                    for key in replay_buffer:
-                        replay_buffer[key].pop(0)
+                replay_buffer["states"][buffer_pos] = state[env_idx].cpu().numpy()
+                replay_buffer["actions"][buffer_pos] = actions[env_idx].cpu().numpy()
+                replay_buffer["rewards"][buffer_pos] = voila_rewards[env_idx].cpu().numpy()
+                replay_buffer["next_states"][buffer_pos] = next_state[env_idx].cpu().numpy()
+                replay_buffer["dones"][buffer_pos] = dones[env_idx].cpu().numpy()
                 
-                replay_buffer["states"].append(state[env_idx].cpu())
-                replay_buffer["actions"].append(actions[env_idx].cpu())
-                replay_buffer["rewards"].append(voila_rewards[env_idx].cpu())
-                replay_buffer["next_states"].append(next_state[env_idx].cpu())
-                replay_buffer["dones"].append(dones[env_idx].cpu())
+                buffer_pos = (buffer_pos + 1) % self.replay_buffer_size
+                if buffer_pos == 0:
+                    buffer_full = True
             
-            # SAC gradient updates
+            # SAC gradient updates with batch collection
             loss_dict = {}
             if global_step >= self.warmup_steps and global_step % self.update_frequency == 0:
-                if len(replay_buffer["states"]) >= self.batch_size:
-                    loss_dict = self._sac_update(replay_buffer)
+                buffer_size = self.replay_buffer_size if buffer_full else buffer_pos
+                if buffer_size >= self.batch_size:
+                    # Multiple gradient steps per update (batch collection pattern)
+                    loss_dict = self._sac_update(replay_buffer, buffer_size)
             
             stop = time.time()
             collection_time = stop - start
@@ -278,67 +276,6 @@ class SACRunner:
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
-    # def _compute_voila_rewards(self, camera_obs, actions, expert_indices, dones, extras, num_expert_frames):
-    #     """Compute VOILA rewards based on SuperPoint matching."""
-    #     num_envs = camera_obs.shape[0]
-    #     voila_rewards = torch.zeros(num_envs, device=self.device)
-    #     collision_penalty = -10.0
-    #     min_matches = 10
-    #     
-    #     for env_idx in range(num_envs):
-    #         # Extract keypoints from current observation
-    #         with torch.no_grad():
-    #             current_desc = self.superpoint.extract_features(camera_obs[env_idx:env_idx+1])
-    #         
-    #         # Local search: check next 3 expert frames
-    #         current_expert_idx = expert_indices[env_idx].item()
-    #         search_range = min(3, num_expert_frames - current_expert_idx - 1)
-    #         
-    #         best_match_density = -1
-    #         best_expert_idx = current_expert_idx
-    #         num_matches = 0
-    #         
-    #         for offset in range(search_range + 1):
-    #             expert_idx = current_expert_idx + offset
-    #             if expert_idx >= num_expert_frames:
-    #                 break
-    #             
-    #             # Match with expert frame
-    #             match_density, matches = self._compute_match_density(
-    #                 current_desc, self.expert_descriptors[expert_idx]
-    #             )
-    #             
-    #             if match_density > best_match_density:
-    #                 best_match_density = match_density
-    #                 best_expert_idx = expert_idx
-    #                 num_matches = matches
-    #         
-    #         # Safety check
-    #         collision = extras.get("collision", torch.zeros(num_envs, dtype=torch.bool, device=self.device))[env_idx]
-    #         
-    #         if num_matches < min_matches or collision:
-    #             voila_rewards[env_idx] = collision_penalty
-    #             dones[env_idx] = True
-    #         else:
-    #             # Calculate VOILA reward: F + V - 0.01 * ||steering||
-    #             F = best_match_density
-    #             
-    #             # V: improvement from previous frame
-    #             if best_expert_idx > current_expert_idx:
-    #                 V = 1.0  # Progressed forward
-    #             else:
-    #                 V = 0.0
-    #             
-    #             # Action penalty (assuming first action dim is steering)
-    #             action_penalty = 0.01 * torch.abs(actions[env_idx, 0]).item()
-    #             
-    #             voila_rewards[env_idx] = F + V - action_penalty
-    #             
-    #             # Update expert index
-    #             expert_indices[env_idx] = best_expert_idx
-    #     
-    #     return voila_rewards
-
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         # Compute the collection size
         collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
@@ -372,13 +309,22 @@ class SACRunner:
         fps = int(self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
         # -- Losses
-        for key, value in locs["loss_dict"].items():
-            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
+        if locs["loss_dict"]:
+            for key, value in locs["loss_dict"].items():
+                self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
 
-        # -- Training
+        # -- Training (SB3-style: always log, use completed episodes or current running mean)
         if len(locs["rewbuffer"]) > 0:
-            self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
-            self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+            mean_reward = statistics.mean(locs["rewbuffer"])
+            mean_ep_len = statistics.mean(locs["lenbuffer"])
+            self.writer.add_scalar("Train/mean_reward", mean_reward, locs["it"])
+            self.writer.add_scalar("Train/mean_episode_length", mean_ep_len, locs["it"])
+            self.writer.add_scalar("Train/mean_reward/completed_episodes", mean_reward, locs["it"])
+        
+        # Always log current running reward (like SB3 rollout/ep_rew_mean)
+        if locs["cur_reward_sum"].numel() > 0:
+            running_mean_reward = locs["cur_reward_sum"].mean().item()
+            self.writer.add_scalar("Train/running_reward", running_mean_reward, locs["it"])
 
         # callback for video logging
         if self.logger_type in ["wandb"]:
@@ -512,19 +458,20 @@ class SACRunner:
             "world_size": self.gpu_world_size,
         }
 
-    def _construct_algorithm(self, obs: TensorDict):
+    def _construct_algorithm(self, obs: torch.Tensor):
         """Construct the SAC algorithm."""
         # Import SAC modules
         from robot_rl.modules.sac import Actor, Critic
         import copy
         
-        # Get observation and action dimensions
-        obs_dim = 1026  # 512 (current) + 512 (previous) + 2 (action) for VOILA
+        # Get observation and action dimensions dynamically
+        base_obs_dim = obs.shape[-1]
         action_dim = self.env.num_actions
+        state_dim = base_obs_dim * 2 + action_dim
         
         # Create actor and critic networks
         actor = Actor(
-            obs_dim=obs_dim,
+            obs_dim=state_dim,
             num_actions=action_dim,
             hidden_dims=self.policy_cfg.get("actor_hidden_dims", [256, 256, 256]),
             activation=self.policy_cfg.get("activation", "elu"),
@@ -532,7 +479,7 @@ class SACRunner:
         ).to(self.device)
         
         critic = Critic(
-            obs_dim=obs_dim,
+            obs_dim=state_dim,
             action_dim=action_dim,
             hidden_dims=self.policy_cfg.get("critic_hidden_dims", [256, 256, 256]),
             activation=self.policy_cfg.get("activation", "elu"),
@@ -578,100 +525,100 @@ class SACRunner:
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
-
-    def _generate_expert_frames(self):
-        """Generate expert rollout frames using world model."""
-        # TODO: Implement world model call
-        # return wm(self.env.num_envs, self.device)
-        print("[WARNING] Using placeholder expert frames. Implement world model integration.")
-        return [torch.randn((1, 3, 256, 256), device=self.device) for _ in range(100)]
     
-    # def _compute_match_density(self, desc1, desc2):
-    #     """Compute match density between two SuperPoint descriptors."""
-    #     # TODO: Implement proper descriptor matching using mutual nearest neighbors
-    #     matches = torch.randint(10, 50, (1,)).item()  # Dummy
-    #     density = matches / 100.0
-    #     return density, matches
-    
-    def _sac_update(self, replay_buffer):
-        """Perform SAC gradient update."""
-        # Sample random batch
-        indices = torch.randint(0, len(replay_buffer["states"]), (self.batch_size,))
+    def _sac_update(self, replay_buffer, buffer_size):
+        """Perform SAC gradient update with multiple gradient steps."""
+        total_critic_loss = 0.0
+        total_actor_loss = 0.0
+        total_alpha_loss = 0.0
+        total_q = 0.0
         
-        states = torch.stack([replay_buffer["states"][i] for i in indices]).to(self.device)
-        actions = torch.stack([replay_buffer["actions"][i] for i in indices]).to(self.device)
-        rewards = torch.stack([replay_buffer["rewards"][i] for i in indices]).unsqueeze(-1).to(self.device)
-        next_states = torch.stack([replay_buffer["next_states"][i] for i in indices]).to(self.device)
-        dones = torch.stack([replay_buffer["dones"][i] for i in indices]).unsqueeze(-1).to(self.device)
-        
-        # Update Critic (Q-functions)
-        with torch.no_grad():
-            # Sample next actions from current policy
-            next_actions, next_log_probs = self.alg.actor(next_states)
+        # Perform multiple gradient steps (batch collection pattern)
+        for _ in range(self.gradient_steps):
+            # Sample random batch efficiently from numpy buffer
+            indices = np.random.randint(0, buffer_size, size=self.batch_size)
             
-            # Compute target Q-values using target critic
-            target_q1, target_q2 = self.alg.target_critic(next_states, next_actions)
-            target_q = torch.min(target_q1, target_q2)
+            states = torch.as_tensor(replay_buffer["states"][indices], device=self.device)
+            actions = torch.as_tensor(replay_buffer["actions"][indices], device=self.device)
+            rewards = torch.as_tensor(replay_buffer["rewards"][indices], device=self.device)
+            next_states = torch.as_tensor(replay_buffer["next_states"][indices], device=self.device)
+            dones = torch.as_tensor(replay_buffer["dones"][indices], device=self.device)
             
-            # Add entropy regularization to target: Q_target = r + γ(Q(s',a') - α*log π(a'|s'))
-            target_q = target_q - self.alpha.detach() * next_log_probs
+            # Update Critic (Q-functions)
+            with torch.no_grad():
+                # Sample next actions from current policy
+                next_actions, next_log_probs = self.alg.actor(next_states)
+                
+                # Compute target Q-values using target critic
+                target_q1, target_q2 = self.alg.target_critic(next_states, next_actions)
+                target_q = torch.min(target_q1, target_q2)
+                
+                # Add entropy regularization to target: Q_target = r + γ(Q(s',a') - α*log π(a'|s'))
+                target_q = target_q - self.alpha.detach() * next_log_probs
+                
+                # Compute TD target: y = r + γ * (1 - done) * Q_target
+                td_target = rewards + self.gamma * (1 - dones.float()) * target_q
             
-            # Compute TD target: y = r + γ * (1 - done) * Q_target
-            td_target = rewards + self.gamma * (1 - dones.float()) * target_q
+            # Compute current Q-values
+            current_q1, current_q2 = self.alg.critic(states, actions)
+            
+            # Compute critic loss (MSE between current Q and TD target)
+            critic_loss = torch.nn.functional.mse_loss(current_q1, td_target) + \
+                          torch.nn.functional.mse_loss(current_q2, td_target)
+            
+            # Update critic
+            self.alg.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            self.alg.critic_optimizer.step()
+            
+            # Update Actor (Policy)
+            # Sample actions from current policy
+            new_actions, log_probs = self.alg.actor(states)
+            
+            # Compute Q-values for new actions
+            q1_new, q2_new = self.alg.critic(states, new_actions)
+            q_new = torch.min(q1_new, q2_new)
+            
+            # Actor loss: maximize Q-value with entropy regularization
+            # J_π = E[α*log π(a|s) - Q(s,a)]
+            actor_loss = (self.alpha.detach() * log_probs - q_new).mean()
+            
+            # Update actor
+            self.alg.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.alg.actor_optimizer.step()
+            
+            # Update Temperature (Alpha)
+            # Automatic entropy tuning: adjust alpha to match target entropy
+            # J_α = E[-α * (log π(a|s) + H_target)]
+            alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
+            
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            
+            # Update alpha value
+            self.alpha = self.log_alpha.exp()
+            
+            # Update Target Networks (Soft Update)
+            # θ_target = τ * θ + (1 - τ) * θ_target
+            with torch.no_grad():
+                for target_param, param in zip(self.alg.target_critic.parameters(), self.alg.critic.parameters()):
+                    target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+            
+            # Accumulate losses for logging
+            total_critic_loss += critic_loss.item()
+            total_actor_loss += actor_loss.item()
+            total_alpha_loss += alpha_loss.item()
+            total_q += q_new.mean().item()
         
-        # Compute current Q-values
-        current_q1, current_q2 = self.alg.critic(states, actions)
-        
-        # Compute critic loss (MSE between current Q and TD target)
-        critic_loss = torch.nn.functional.mse_loss(current_q1, td_target) + \
-                      torch.nn.functional.mse_loss(current_q2, td_target)
-        
-        # Update critic
-        self.alg.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.alg.critic_optimizer.step()
-        
-        # Update Actor (Policy)
-        # Sample actions from current policy
-        new_actions, log_probs = self.alg.actor(states)
-        
-        # Compute Q-values for new actions
-        q1_new, q2_new = self.alg.critic(states, new_actions)
-        q_new = torch.min(q1_new, q2_new)
-        
-        # Actor loss: maximize Q-value with entropy regularization
-        # J_π = E[α*log π(a|s) - Q(s,a)]
-        actor_loss = (self.alpha.detach() * log_probs - q_new).mean()
-        
-        # Update actor
-        self.alg.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.alg.actor_optimizer.step()
-        
-        # Update Temperature (Alpha)
-        # Automatic entropy tuning: adjust alpha to match target entropy
-        # J_α = E[-α * (log π(a|s) + H_target)]
-        alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
-        
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
-        
-        # Update alpha value
-        self.alpha = self.log_alpha.exp()
-        
-        # Update Target Networks (Soft Update)
-        # θ_target = τ * θ + (1 - τ) * θ_target
-        with torch.no_grad():
-            for target_param, param in zip(self.alg.target_critic.parameters(), self.alg.critic.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-        
+        # Average losses over gradient steps
         loss_dict = {
-            "critic_loss": critic_loss.item(),
-            "actor_loss": actor_loss.item(),
-            "alpha_loss": alpha_loss.item(),
+            "critic_loss": total_critic_loss / self.gradient_steps,
+            "actor_loss": total_actor_loss / self.gradient_steps,
+            "alpha_loss": total_alpha_loss / self.gradient_steps,
             "alpha": self.alpha.item(),
-            "mean_q": q_new.mean().item(),
+            "mean_q": total_q / self.gradient_steps,
         }
         
         return loss_dict

@@ -8,9 +8,11 @@
 from .on_policy_runner import OnPolicyRunner  # isort:skip
 from .distillation_runner import DistillationRunner
 from .probe_runner import ProbeRunner
+from .sac_runner import SACRunner
 
 __all__ = [
     "OnPolicyRunner",
     "DistillationRunner",
     "ProbeRunner",
+    "SACRunner",
 ]
