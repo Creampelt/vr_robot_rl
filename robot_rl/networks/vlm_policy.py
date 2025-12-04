@@ -3,13 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Vision-Language Model (VLM) based policy for embodied navigation.
+"""Vision-Language conditioned policy using camera_latent.
 
-This module implements a VLM-based policy where:
-1. Camera observations are processed by a VLM to generate text descriptions
-2. Text descriptions are embedded using a sentence transformer  
-3. Text embeddings are used by robot_rl's ActorCritic module for action prediction
-4. Compatible with PPO training
+This module conditions a small language model via soft prompts generated from
+`camera_latent` to produce concise navigation text, which is then embedded
+into fixed-size vectors for ActorCritic. The structure ensures compatibility
+with PPO storage and evaluation.
 """
 
 from __future__ import annotations
@@ -18,174 +17,44 @@ import os
 import torch
 import torch.nn as nn
 from typing import List, Dict
-from transformers import AutoProcessor, AutoModelForVision2Seq, AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 
 
-class VLMTextEncoder(nn.Module):
-    """Efficient Vision-Language Model that converts camera images to text descriptions.
-    
-    Supports both single-frame and multi-frame (world model rollout) processing.
-    Uses small, efficient VLMs optimized for edge deployment and fast inference.
-    """
-    
-    def __init__(
-        self,
-        vlm_model_name: str = "Qwen/Qwen2-VL-2B-Instruct",
-        prompt_template: str = "You are a navigation expert helping a mobile robot. Based on the sequence of predicted future observations from the world model, describe the optimal navigation action (direction and speed) the robot should take to safely reach its goal efficiently. Consider obstacles, free space, and goal direction.",
-        max_new_tokens: int = 50,
-        use_temporal_context: bool = True,
-        device: str = "cuda"
-    ):
-        """Initialize the VLM text encoder.
-        
-        Recommended small VLMs (ordered by quality):
-        - "Qwen/Qwen2-VL-2B-Instruct" (2B params) - Default, SOTA quality for size, very fast
-        - "microsoft/Phi-3.5-vision-instruct" (4.2B params) - Excellent reasoning
-        - "vikhyatk/moondream2" (1.8B params) - Fastest, good for edge
-        - "OpenGVLab/InternVL2-2B" (2B params) - Strong vision understanding
-        
-        Args:
-            vlm_model_name: HuggingFace model name for the VLM
-            prompt_template: Text prompt for better descriptions (designed for temporal reasoning)
-            max_new_tokens: Maximum tokens to generate (keep moderate for temporal reasoning)
-            use_temporal_context: If True, processes multiple frames as temporal sequence
-            device: Device to run the model on
-        """
+class SoftPromptTextEncoder(nn.Module):
+    """Condition a small LM with camera_latent via soft prompts to generate text."""
+
+    def __init__(self, lm_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0", soft_prompt_len: int = 16, latent_dim: int = 384, device: str = "cuda"):
         super().__init__()
-        
-        self.vlm_model_name = vlm_model_name
-        self.prompt_template = prompt_template
-        self.max_new_tokens = max_new_tokens
-        self.use_temporal_context = use_temporal_context
         self.device = device
-        
-        # Get HuggingFace token if needed
-        hf_token = os.environ.get("HF_TOKEN", None)
-        
-        print(f"[VLMTextEncoder] Loading VLM model: {vlm_model_name}")
-        print(f"[VLMTextEncoder] Temporal context: {use_temporal_context}")
-        
-        # Load VLM processor and model
-        self.processor = AutoProcessor.from_pretrained(
-            vlm_model_name,
-            token=hf_token,
-            trust_remote_code=True
-        )
-        
-        self.vlm_model = AutoModelForVision2Seq.from_pretrained(
-            vlm_model_name,
-            torch_dtype=torch.float16,  # Use FP16 for efficiency
-            token=hf_token,
-            trust_remote_code=True
-        ).to(device)
-        
-        self.vlm_model.eval()
-        
-    def forward(self, images: torch.Tensor, world_model_rollout: torch.Tensor = None) -> List[str]:
-        """Generate text descriptions from camera images with optional world model rollout.
-        
-        Args:
-            images: Current observation images. Shape is BxHxWx3 or Bx3xHxW
-            world_model_rollout: Optional predicted future frames from world model.
-                                Shape is BxTxHxWx3 or BxTx3xHxW where T is rollout horizon
-            
-        Returns:
-            List of text descriptions with action recommendations
-        """
-        B = images.shape[0]
-        
-        # Use world model rollout if provided and temporal context is enabled
-        if self.use_temporal_context and world_model_rollout is not None:
-            # World model rollout: BxTxHxWx3 or BxTx3xHxW
-            if world_model_rollout.ndim == 5:
-                T = world_model_rollout.shape[1]
-                
-                # Convert from BxTxHxWxC to BxTxCxHxW if needed
-                if world_model_rollout.shape[-1] == 3:
-                    world_model_rollout = world_model_rollout.permute(0, 1, 4, 2, 3)
-                
-                # Convert to float [0, 1] if needed
-                if world_model_rollout.dtype == torch.uint8:
-                    world_model_rollout = world_model_rollout.float() / 255.0
-                
-                # Create enhanced prompt with temporal information
-                enhanced_prompts = [
-                    f"{self.prompt_template} Here are {T} predicted future frames showing what the robot will see if it continues. Frame 1 is immediate future, Frame {T} is furthest. What action should the robot take NOW?"
-                ] * B
-                
-                # Process multiple frames per batch item
-                # Flatten to (B*T)x3xHxW for processing
-                all_frames = world_model_rollout.reshape(B * T, *world_model_rollout.shape[2:])
-                
-                with torch.no_grad():
-                    # Note: Some VLMs support multi-image input natively
-                    # For simplicity, we'll process frames sequentially and let the VLM reason about them
-                    inputs = self.processor(
-                        images=list(all_frames),
-                        text=enhanced_prompts * T,  # Repeat prompt for each frame
-                        return_tensors="pt",
-                        padding=True
-                    ).to(self.device)
-                    
-                    generated_ids = self.vlm_model.generate(
-                        **inputs,
-                        max_new_tokens=self.max_new_tokens,
-                        do_sample=False,
-                        num_beams=1
-                    )
-                    
-                    generated_texts = self.processor.batch_decode(
-                        generated_ids,
-                        skip_special_tokens=True
-                    )
-                    
-                    # Take first B descriptions (one per batch item)
-                    generated_texts = generated_texts[:B]
-            else:
-                # Fallback to single frame if rollout shape is unexpected
-                generated_texts = self._process_single_frame(images, B)
-        else:
-            # Process single frame (current observation only)
-            generated_texts = self._process_single_frame(images, B)
-        
-        return generated_texts
-    
-    def _process_single_frame(self, images: torch.Tensor, B: int) -> List[str]:
-        """Process single frame observations."""
-        # Convert from BxHxWxC to BxCxHxW if needed
-        if images.shape[-1] == 3:
-            images = images.permute(0, 3, 1, 2)
-        
-        # Convert to float [0, 1] if needed
-        if images.dtype == torch.uint8:
-            images = images.float() / 255.0
-        
-        # Simple prompt for single frame
-        single_frame_prompt = "You are a navigation expert. Based on this camera view, what navigation action (direction and speed) should the robot take to reach its goal safely and efficiently?"
-        
-        with torch.no_grad():
-            prompts = [single_frame_prompt] * B
-            inputs = self.processor(
-                images=list(images),
-                text=prompts,
-                return_tensors="pt",
-                padding=True
-            ).to(self.device)
-            
-            generated_ids = self.vlm_model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                num_beams=1
-            )
-            
-            generated_texts = self.processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=True
-            )
-        
-        return generated_texts
+        self.tokenizer = AutoTokenizer.from_pretrained(lm_name)
+        self.lm = AutoModelForCausalLM.from_pretrained(lm_name, torch_dtype=torch.float16).to(device)
+        self.lm.eval()
+        hidden_size = self.lm.config.hidden_size
+        # Map incoming latents to soft_prompt_len * hidden_size; allow lazy in_features
+        try:
+            self.soft_prompt = nn.LazyLinear(soft_prompt_len * hidden_size)
+        except Exception:
+            # Fallback to fixed Linear if LazyLinear unavailable
+            self.soft_prompt = nn.Linear(latent_dim, soft_prompt_len * hidden_size)
+        # Ensure soft prompt projection matches LM dtype (fp16)
+        self.soft_prompt = self.soft_prompt.to(device).half()
+        self.soft_prompt_len = soft_prompt_len
 
+    def forward(self, latents: torch.Tensor, instruction: str) -> List[str]:
+        B = latents.shape[0]
+        with torch.no_grad():
+            # Ensure dtype/device compatibility for Linear
+            # Ensure dtype/device compatibility for Linear
+            # Force latents to fp16 for LM compatibility
+            latents_fp = latents.to(dtype=torch.float16, device=self.device)
+            prompt_embeds = self.soft_prompt(latents_fp).view(B, self.soft_prompt_len, self.lm.config.hidden_size)
+            toks = self.tokenizer([instruction] * B, return_tensors="pt", padding=True).to(self.device)
+            input_ids = toks.input_ids
+            base_embeds = self.lm.get_input_embeddings()(input_ids).to(dtype=torch.float16)
+            inputs_embeds = torch.cat([prompt_embeds, base_embeds], dim=1)
+            generated = self.lm.generate(inputs_embeds=inputs_embeds, max_new_tokens=32, do_sample=False)
+            texts = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
+        return texts
 
 class TextEmbedder(nn.Module):
     """Embeds text descriptions into fixed-size vectors using sentence transformers."""
@@ -261,21 +130,15 @@ class TextEmbedder(nn.Module):
         return embeddings
 
 class VLMObservationEncoder(nn.Module):
-    """Processes camera observations through VLM+text embeddings.
-    
-    Supports world model rollouts for improved temporal reasoning.
-    This module combines VLMTextEncoder and TextEmbedder to convert
-    camera images (and optional predicted future frames) into fixed-size 
-    embeddings that can be used as observations by standard actor-critic networks.
-    """
+    """Processes camera_latent via soft-prompt LM -> text -> embeddings."""
     def __init__(
         self,
-        vlm_model_name: str = "Qwen/Qwen2-VL-2B-Instruct",
+        lm_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         text_model_name: str = "sentence-transformers/all-mpnet-base-v2",
         embedding_dim: int = 768,
-        prompt_template: str = None,  # Will use VLMTextEncoder default
-        max_new_tokens: int = 50,
-        use_temporal_context: bool = True,
+        latent_dim: int = 384,
+        prompt_template: str = "You are a navigation expert. Based on the latent features, describe the immediate action (direction and speed) to move safely towards the goal.",
+        soft_prompt_len: int = 16,
         device: str = "cuda"
     ):
         """Initialize the VLM observation encoder.
@@ -293,19 +156,9 @@ class VLMObservationEncoder(nn.Module):
         
         self.embedding_dim = embedding_dim
         self.device = device
-        self.use_temporal_context = use_temporal_context
-        
-        # Initialize VLM text encoder with temporal reasoning support
-        vlm_kwargs = {
-            "vlm_model_name": vlm_model_name,
-            "max_new_tokens": max_new_tokens,
-            "use_temporal_context": use_temporal_context,
-            "device": device
-        }
-        if prompt_template is not None:
-            vlm_kwargs["prompt_template"] = prompt_template
-            
-        self.vlm_encoder = VLMTextEncoder(**vlm_kwargs)
+        self.prompt_template = prompt_template
+        # Use latent_dim for camera_latent input width
+        self.vlm_encoder = SoftPromptTextEncoder(lm_name=lm_name, soft_prompt_len=soft_prompt_len, latent_dim=latent_dim, device=device)
         
         # Initialize text embedder
         self.text_embedder = TextEmbedder(
@@ -320,22 +173,9 @@ class VLMObservationEncoder(nn.Module):
         for param in self.text_embedder.parameters():
             param.requires_grad = False
     
-    def forward(self, images: torch.Tensor, world_model_rollout: torch.Tensor = None) -> torch.Tensor:
-        """Process images (and optional world model rollout) through VLM to get text embeddings.
-        
-        Args:
-            images: Current observation images. Shape is BxHxWx3 or Bx3xHxW
-            world_model_rollout: Optional predicted future frames. Shape is BxTxHxWx3 or BxTx3xHxW
-            
-        Returns:
-            Text embeddings, shape (B, embedding_dim)
-        """
-        # Generate text descriptions from images with world model context
-        texts = self.vlm_encoder(images, world_model_rollout)
-        
-        # Embed texts into fixed-size vectors
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        texts = self.vlm_encoder(latents, self.prompt_template)
         embeddings = self.text_embedder(texts)
-        
         return embeddings
     
     def get_text_descriptions(self, images: torch.Tensor, world_model_rollout: torch.Tensor = None) -> List[str]:
@@ -349,7 +189,6 @@ class VLMObservationEncoder(nn.Module):
             List of text descriptions
         """
         return self.vlm_encoder(images, world_model_rollout)
-
 
 class VLMActorCritic(nn.Module):
     """Actor-Critic network that uses VLM-generated text embeddings as observations.
@@ -366,6 +205,7 @@ class VLMActorCritic(nn.Module):
         self,
         vlm_encoder: VLMObservationEncoder,
         num_actions: int,
+        num_critic_obs: int = None,
         actor_hidden_dims: List[int] = [256, 128, 64],
         critic_hidden_dims: List[int] = [256, 128, 64],
         activation: str = "elu",
@@ -379,6 +219,8 @@ class VLMActorCritic(nn.Module):
         Args:
             vlm_encoder: The VLM observation encoder (frozen)
             num_actions: Number of action dimensions
+            num_critic_obs: Total dimension of critic observations (VLM embeddings + velocity + actions + clock, etc.).
+                          If None, defaults to vlm_encoder.embedding_dim (symmetric actor-critic)
             actor_hidden_dims: Hidden layer dimensions for actor MLP
             critic_hidden_dims: Hidden layer dimensions for critic MLP
             activation: Activation function
@@ -391,17 +233,29 @@ class VLMActorCritic(nn.Module):
         
         self.vlm_encoder = vlm_encoder
         self.num_actions = num_actions
+        # Mirror encoder's prompt template for convenience
+        self.prompt_template = getattr(vlm_encoder, "prompt_template", "")
+        self.actor_obs_dim = vlm_encoder.embedding_dim
         
         # Import ActorCritic from robot_rl.modules
         from robot_rl.modules import ActorCritic
         from tensordict import TensorDict
         
         # Create fake observation TensorDict for ActorCritic initialization
-        # ActorCritic expects obs groups, we'll use "policy" and "critic" with VLM embeddings
-        obs_dim = vlm_encoder.embedding_dim
+        # ActorCritic expects obs groups, we'll use "policy" and "critic"
+        actor_obs_dim = vlm_encoder.embedding_dim
+        
+        # If num_critic_obs not provided, use symmetric actor-critic (same as actor)
+        if num_critic_obs is None:
+            num_critic_obs = actor_obs_dim
+            print(f"[VLMActorCritic] Using symmetric actor-critic with {actor_obs_dim}-dim observations")
+        else:
+            print(f"[VLMActorCritic] Using asymmetric actor-critic: actor={actor_obs_dim}-dim, critic={num_critic_obs}-dim")
+        self.critic_obs_dim = num_critic_obs
+        
         fake_obs = TensorDict({
-            "policy": torch.zeros(1, obs_dim),
-            "critic": torch.zeros(1, obs_dim)
+            "policy": torch.zeros(1, actor_obs_dim),
+            "critic": torch.zeros(1, num_critic_obs)
         }, batch_size=[1])
         
         obs_groups = {
@@ -423,7 +277,7 @@ class VLMActorCritic(nn.Module):
             noise_std_type=noise_std_type
         )
         
-        print(f"[VLMActorCritic] Created with {obs_dim}-dim VLM embeddings -> {num_actions} actions")
+        print(f"[VLMActorCritic] Created with {actor_obs_dim}-dim actor obs, {num_critic_obs}-dim critic obs -> {num_actions} actions")
     
     def forward(self, observations: torch.Tensor):
         """Forward pass for actor-critic.
@@ -434,12 +288,8 @@ class VLMActorCritic(nn.Module):
         Returns:
             TensorDict with actor and critic outputs
         """
-        # Check if observations are images or embeddings
-        if observations.ndim == 4:  # Images: BxHxWx3
-            # Process through VLM to get text embeddings
-            embeddings = self.vlm_encoder(observations)
-        else:  # Already embeddings: Bxembedding_dim
-            embeddings = observations
+        # Observations expected to be camera_latent (BxD)
+        embeddings = observations if observations.ndim == 2 else observations
         
         # Create TensorDict with embeddings for both policy and critic
         from tensordict import TensorDict
@@ -452,38 +302,284 @@ class VLMActorCritic(nn.Module):
         return self.actor_critic.act_inference(obs_td)
     
     def act(self, observations, **kwargs):
-        """Forward wrapper for compatibility."""
-        return self.actor_critic.act(observations, **kwargs)
+        """Forward wrapper for compatibility with PPO training."""
+        from tensordict import TensorDict
+        
+        # Check if observations are already processed embeddings (flat tensors)
+        if isinstance(observations, TensorDict) and "policy" in observations and "critic" in observations:
+            policy_obs = observations["policy"]
+            critic_obs = observations["critic"]
+            
+            # Both should be flat 2D tensors if already processed
+            policy_processed = isinstance(policy_obs, torch.Tensor) and policy_obs.ndim == 2 and policy_obs.shape[1] in [384, 768, 1024]
+            critic_processed = isinstance(critic_obs, torch.Tensor) and critic_obs.ndim == 2
+            
+            if policy_processed and critic_processed:
+                # Already processed - pass directly
+                return self.actor_critic.act(observations, **kwargs)
+        
+        # Process observations through VLM encoder to get embeddings
+        obs_td = self._process_observations(observations)
+        return self.actor_critic.act(obs_td, **kwargs)
     
     def act_inference(self, observations, **kwargs):
         """Inference wrapper for compatibility."""
-        return self.actor_critic.act_inference(observations, **kwargs)
+        from tensordict import TensorDict
+        
+        # Check if observations are already processed embeddings (flat tensors)
+        if isinstance(observations, TensorDict) and "policy" in observations and "critic" in observations:
+            policy_obs = observations["policy"]
+            critic_obs = observations["critic"]
+            
+            policy_processed = isinstance(policy_obs, torch.Tensor) and policy_obs.ndim == 2 and policy_obs.shape[1] in [384, 768, 1024]
+            critic_processed = isinstance(critic_obs, torch.Tensor) and critic_obs.ndim == 2
+            
+            if policy_processed and critic_processed:
+                # Already processed
+                return self.actor_critic.act_inference(observations, **kwargs)
+        
+        obs_td = self._process_observations(observations)
+        return self.actor_critic.act_inference(obs_td, **kwargs)
     
     def evaluate(self, observations, **kwargs):
         """Evaluate wrapper for compatibility."""
-        return self.actor_critic.evaluate(observations, **kwargs)
+        from tensordict import TensorDict
+        
+        # During PPO updates, observations from buffer are already processed
+        # Check if they're already in the right format (flat tensors)
+        if isinstance(observations, TensorDict) and "policy" in observations and "critic" in observations:
+            policy_obs = observations["policy"]
+            critic_obs = observations["critic"]
+            
+            policy_is_processed = (isinstance(policy_obs, torch.Tensor) and 
+                                  policy_obs.ndim == 2 and 
+                                  policy_obs.shape[1] in [384, 768, 1024])
+            critic_is_processed = isinstance(critic_obs, torch.Tensor) and critic_obs.ndim == 2
+            
+            if policy_is_processed and critic_is_processed:
+                # Already processed, pass directly
+                return self.actor_critic.evaluate(observations, **kwargs)
+        
+        # Not yet processed, process observations through VLM
+        obs_td = self._process_observations(observations)
+        return self.actor_critic.evaluate(obs_td, **kwargs)
+    
+    def _process_observations(self, observations):
+        """Process observations through VLM encoder and create TensorDict.
+        
+        Args:
+            observations: TensorDict with camera images or embeddings
+            
+        Returns:
+            TensorDict with VLM embeddings for policy and critic
+        """
+        from tensordict import TensorDict
+
+        # Helpers: ensure tensors are (B, D) and align dtype/device
+        def _flatten_2d(x: torch.Tensor) -> torch.Tensor:
+            if x.ndim == 2:
+                return x
+            if x.ndim == 1:
+                return x.unsqueeze(-1)
+            if x.ndim == 0:
+                return x.view(1, 1)
+            return x.flatten(start_dim=1)
+
+        def _align_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+            return x.to(dtype=ref.dtype, device=ref.device)
+
+        def _match_dim(x: torch.Tensor, dim: int) -> torch.Tensor:
+            x = _flatten_2d(x)
+            cur = x.shape[1]
+            if cur == dim:
+                return x
+            if cur > dim:
+                return x[:, :dim]
+            # pad zeros to the right
+            pad = torch.zeros(x.shape[0], dim - cur, dtype=x.dtype, device=x.device)
+            return torch.cat([x, pad], dim=1)
+
+        # 1) Extract camera_latent for policy
+        latents: torch.Tensor
+        critic_obs = None
+
+        if isinstance(observations, TensorDict):
+            # Prefer nested groups
+            if "policy" in observations:
+                policy_group = observations["policy"]
+                if isinstance(policy_group, TensorDict):
+                    # camera_latent under policy group
+                    if "camera_latent" in policy_group:
+                        latents = _flatten_2d(policy_group["camera_latent"])
+                    # Sometimes camera key reused for latents
+                    elif "camera" in policy_group:
+                        latents = _flatten_2d(policy_group["camera"])
+                    else:
+                        # If policy is already a tensor (embeddings/latents)
+                        raise ValueError(f"Policy group missing 'camera_latent'/'camera'. Keys: {list(policy_group.keys())}")
+                elif isinstance(policy_group, torch.Tensor):
+                    latents = _flatten_2d(policy_group)
+                else:
+                    raise ValueError("Unsupported policy group type")
+            elif "camera_latent" in observations:
+                latents = _flatten_2d(observations["camera_latent"])
+            elif "camera" in observations:
+                latents = _flatten_2d(observations["camera"])  # expected to be latents
+            else:
+                raise ValueError(f"Could not find camera_latent. Top-level keys: {list(observations.keys())}")
+
+            # Critic obs (optional, for asymmetric)
+            critic_obs = observations.get("critic", None)
+        else:
+            # Observations directly are latents/embeddings
+            latents = _flatten_2d(observations)
+
+        if latents.ndim != 2:
+            raise ValueError(f"Expected 2D latent tensor, got shape: {latents.shape}")
+
+        # 2) Encode latents via soft-prompt LM -> text -> embeddings
+        # Encode latents via VLMObservationEncoder (uses internal prompt)
+        embeddings = self.vlm_encoder(latents)
+
+        # 3) Build critic vector
+        if critic_obs is not None:
+            if isinstance(critic_obs, TensorDict):
+                parts = []
+                # If critic has its own camera_latent, encode similarly
+                if "camera_latent" in critic_obs:
+                    c_lat = _flatten_2d(critic_obs["camera_latent"])
+                    c_emb = self.vlm_encoder(_align_like(c_lat, embeddings))
+                    parts.append(c_emb)
+                elif "camera" in critic_obs:
+                    c_lat = _flatten_2d(critic_obs["camera"])  # expected to be latents
+                    c_emb = self.vlm_encoder(_align_like(c_lat, embeddings))
+                    parts.append(c_emb)
+                else:
+                    # No camera component; actor embeddings may still be enough
+                    parts.append(embeddings)
+
+                # Append other critic features
+                for key in sorted(critic_obs.keys()):
+                    if key in ("camera", "camera_latent"):
+                        continue
+                    val = critic_obs[key]
+                    if isinstance(val, torch.Tensor):
+                        parts.append(_align_like(_flatten_2d(val), embeddings))
+
+                critic_vec = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
+            elif isinstance(critic_obs, torch.Tensor):
+                # Ensure critic always includes VLM embedding + extras
+                critic_extra = _align_like(_flatten_2d(critic_obs), embeddings)
+                critic_vec = torch.cat([embeddings, critic_extra], dim=-1)
+            else:
+                critic_vec = embeddings
+        else:
+            critic_vec = embeddings
+
+        # 4) Ensure dims match ActorCritic expectations
+        embeddings = _match_dim(embeddings, self.actor_obs_dim)
+        critic_vec = _match_dim(critic_vec, self.critic_obs_dim)
+
+        # 5) Return standardized TensorDict for ActorCritic
+        from tensordict import TensorDict as TD
+        return TD({
+            "policy": embeddings,
+            "critic": critic_vec
+        }, batch_size=[embeddings.shape[0]])
     
     def reset(self, dones=None):
         """Reset wrapper for compatibility."""
         return self.actor_critic.reset(dones)
     
     def get_text_descriptions(self, observations: torch.Tensor) -> List[str]:
-        """Get text descriptions for visualization/debugging."""
-        if observations.ndim == 4:  # Images
-            return self.vlm_encoder.get_text_descriptions(observations)
+        if observations.ndim == 2:
+            # Return texts generated by the inner soft-prompt LM
+            return self.vlm_encoder.vlm_encoder(observations, getattr(self.vlm_encoder, "prompt_template", ""))
         else:
-            return ["(Pre-computed embeddings - no text available)"] * observations.shape[0]
+            return ["(Expected camera_latent)"] * observations.shape[0]
     
     @property
     def is_recurrent(self):
         return self.actor_critic.is_recurrent
+    
+    @property
+    def action_std(self):
+        """Delegate to wrapped actor_critic."""
+        return self.actor_critic.action_std
+    
+    @property
+    def action_mean(self):
+        """Delegate to wrapped actor_critic."""
+        return self.actor_critic.action_mean
+
+    @property
+    def entropy(self):
+        """Expose latest policy entropy recorded by inner ActorCritic."""
+        return getattr(self.actor_critic, "entropy", None)
+    
+    def get_actions_log_prob(self, actions):
+        """Get log probabilities for given actions - required by PPO.
+        
+        Note: This method doesn't receive observations as parameter.
+        PPO/algorithms access observations from their own storage buffer.
+        We delegate directly to the wrapped actor_critic.
+        """
+        return self.actor_critic.get_actions_log_prob(actions)
+    
+    def get_values(self, observations):
+        """Get value estimates - required by PPO."""
+        obs_td = self._process_observations(observations)
+        return self.actor_critic.get_values(obs_td)
+    
+    def update(self):
+        """Update normalizers if present."""
+        if hasattr(self.actor_critic, 'update'):
+            return self.actor_critic.update()
+    
+    def update_normalization(self, obs, **kwargs):
+        """Update observation normalization - required by PPO."""
+        if hasattr(self.actor_critic, 'update_normalization'):
+            # Process observations through VLM if needed
+            obs_td = self._process_observations(obs)
+            # Process last_obs if provided
+            if 'last_obs' in kwargs and kwargs['last_obs'] is not None:
+                kwargs['last_obs'] = self._process_observations(kwargs['last_obs'])
+            return self.actor_critic.update_normalization(obs_td, **kwargs)
+    
+    def train(self, mode=True):
+        """Set training mode."""
+        super().train(mode)
+        self.actor_critic.train(mode)
+        return self
+    
+    def eval(self):
+        """Set evaluation mode."""
+        return self.train(False)
+    
+    def state_dict(self, *args, **kwargs):
+        """Get state dict - delegate to actor_critic."""
+        return self.actor_critic.state_dict(*args, **kwargs)
+    
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        """Load state dict - delegate to actor_critic."""
+        return self.actor_critic.load_state_dict(state_dict, *args, **kwargs)
+    
+    def to(self, device):
+        """Move to device."""
+        super().to(device)
+        self.vlm_encoder.to(device)
+        self.actor_critic.to(device)
+        return self
 
 
 # Convenience function to create a VLM-based actor-critic
 def create_vlm_actor_critic(
     num_actions: int,
-    vlm_model_name: str = "Qwen/Qwen2-VL-2B-Instruct",
+    num_critic_obs: int = None,
+    lm_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     text_model_name: str = "sentence-transformers/all-mpnet-base-v2",
+    soft_prompt_len: int = 16,
+    latent_dim: int = 384,
     actor_hidden_dims: List[int] = [256, 128, 64],
     critic_hidden_dims: List[int] = [256, 128, 64],
     activation: str = "elu",
@@ -501,6 +597,8 @@ def create_vlm_actor_critic(
     
     Args:
         num_actions: Number of action dimensions
+        num_critic_obs: Total dimension of critic observations (embeddings + velocity + actions + clock, etc.).
+                       If None, uses symmetric actor-critic (same as actor)
         vlm_model_name: VLM model name (default: Qwen2-VL-2B, SOTA for 2B params)
         text_model_name: Text embedding model name (default: all-mpnet-base-v2, best quality)
         actor_hidden_dims: Actor MLP hidden dimensions
@@ -517,8 +615,10 @@ def create_vlm_actor_critic(
     """
     # Create VLM observation encoder
     vlm_encoder = VLMObservationEncoder(
-        vlm_model_name=vlm_model_name,
+        lm_name=lm_name,
         text_model_name=text_model_name,
+        soft_prompt_len=soft_prompt_len,
+        latent_dim=latent_dim,
         device=device
     )
     
@@ -526,6 +626,7 @@ def create_vlm_actor_critic(
     actor_critic = VLMActorCritic(
         vlm_encoder=vlm_encoder,
         num_actions=num_actions,
+        num_critic_obs=num_critic_obs,
         actor_hidden_dims=actor_hidden_dims,
         critic_hidden_dims=critic_hidden_dims,
         activation=activation,

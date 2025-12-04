@@ -8,4 +8,4 @@
 from .memory import Memory
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
-from .vlm_policy import VLMObservationEncoder, VLMTextEncoder, TextEmbedder, VLMActorCritic, create_vlm_actor_critic
+from .vlm_policy import VLMObservationEncoder, TextEmbedder, VLMActorCritic, create_vlm_actor_critic
