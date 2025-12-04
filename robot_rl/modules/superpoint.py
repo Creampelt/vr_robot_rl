@@ -98,6 +98,7 @@ class SuperPoint(nn.Module):
         )
 
     def forward(self, image: torch.Tensor) -> list[torch.Tensor]:
+        image = image.permute(0, 3, 1, 2)  # BxHxWxC -> BxCxHxW
         if image.shape[1] == 3:  # RGB to gray
             scale = image.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
             image = (image * scale).sum(1, keepdim=True)

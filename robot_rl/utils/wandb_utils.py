@@ -118,7 +118,8 @@ class WandbSummaryWriter(SummaryWriter):
                 elif video_info["size"] == video_size_kb and video_size_kb > 100:
                     # wait 10 steps after recording has been completed
                     if video_info["steps"] > 10:
-                        self.add_video(video_name, log_name=log_name)
+                        vid_log_name = video.parent.name if video.parent.name != "train" else log_name
+                        self.add_video(video_name, log_name=vid_log_name)
                         self.saved_videos[video_name]["recorded"] = True
                     else:
                         video_info["steps"] += 1
