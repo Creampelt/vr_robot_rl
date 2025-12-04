@@ -1,17 +1,33 @@
+import os
 import torch
 import torch.nn as nn
 from transformers import AutoImageProcessor, AutoModel
+from huggingface_hub import login
 
 class RAE(nn.Module):
     def __init__(self, pretrained_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m") -> None:
         super().__init__()
+        
+        # Authenticate with HuggingFace for gated models
+        hf_token = os.environ.get("HF_TOKEN")
+        if hf_token:
+            print(f"[RAE] Authenticating with HuggingFace token: {hf_token[:10]}...")
+            login(token=hf_token)
+        else:
+            print("[RAE] WARNING: HF_TOKEN not found in environment variables")
+        
         self.feature_dim = 384
-        self.processor = AutoImageProcessor.from_pretrained(pretrained_model_name, use_fast=True)
+        self.processor = AutoImageProcessor.from_pretrained(
+            pretrained_model_name, 
+            use_fast=True,
+            token=hf_token
+        )
 
         self.model = AutoModel.from_pretrained(
             pretrained_model_name,
             dtype=torch.bfloat16,
             device_map="auto",
+            token=hf_token
         )
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
